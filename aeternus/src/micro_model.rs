@@ -126,12 +126,60 @@ pub fn small() -> MicroModel {
     ], 0xFACE_FEED)
 }
 
+/// ~1.3B params — 24-layer transformer (H=2048, FFN=8192).
+pub fn medium() -> MicroModel {
+    let h: u32 = 2048;
+    let ffn: u32 = 8192;
+    let n_layers: usize = 24;
+    let mut arch = Vec::new();
+    for _ in 0..n_layers {
+        arch.push((h, h, Activation::None));     // attn QKV
+        arch.push((h, h, Activation::None));     // attn output
+        arch.push((ffn, h, Activation::SiLU));   // FFN up
+        arch.push((h, ffn, Activation::None));   // FFN down
+    }
+    MicroModel::new("medium", &arch, 0x7070_1B00)
+}
+
+/// ~6.7B params — 32-layer transformer (H=4096, FFN=11008).
+pub fn large() -> MicroModel {
+    let h: u32 = 4096;
+    let ffn: u32 = 11008;
+    let n_layers: usize = 32;
+    let mut arch = Vec::new();
+    for _ in 0..n_layers {
+        arch.push((h, h, Activation::None));
+        arch.push((h, h, Activation::None));
+        arch.push((ffn, h, Activation::SiLU));
+        arch.push((h, ffn, Activation::None));
+    }
+    MicroModel::new("large", &arch, 0x7070_7B00)
+}
+
+/// ~65B params — 80-layer transformer (H=8192, FFN=28672).
+pub fn xl() -> MicroModel {
+    let h: u32 = 8192;
+    let ffn: u32 = 28672;
+    let n_layers: usize = 80;
+    let mut arch = Vec::new();
+    for _ in 0..n_layers {
+        arch.push((h, h, Activation::None));
+        arch.push((h, h, Activation::None));
+        arch.push((ffn, h, Activation::SiLU));
+        arch.push((h, ffn, Activation::None));
+    }
+    MicroModel::new("xl", &arch, 0x7070_70B0)
+}
+
 pub fn get_model(name: &str) -> Option<MicroModel> {
     match name {
         "nano" => Some(nano()),
         "micro" => Some(micro()),
         "mini" => Some(mini()),
         "small" => Some(small()),
+        "medium" => Some(medium()),
+        "large" => Some(large()),
+        "xl" => Some(xl()),
         _ => None,
     }
 }
@@ -187,6 +235,11 @@ pub fn forward_cpu(model: &MicroModel, input: &[f32]) -> Vec<f32> {
 // ---------------------------------------------------------------------------
 
 pub fn forward_gpu(model: &MicroModel, input: &[f32]) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+    // For models with many layers, use the streaming path.
+    if model.layers.len() > 16 {
+        return forward_gpu_streaming(model, input);
+    }
+
     let ctx = VulkanContext::new()?;
     let gemv_pipeline = GemvPipeline::new(&ctx.device)?;
     let act_pipeline = ActivationPipeline::new(&ctx.device)?;
@@ -322,6 +375,209 @@ pub fn forward_gpu(model: &MicroModel, input: &[f32]) -> Result<Vec<f32>, Box<dy
     }
 
     // Cleanup shared resources.
+    codebook_buf.destroy(&ctx.device, &ctx.allocator);
+    act_pipeline.destroy(&ctx.device);
+    gemv_pipeline.destroy(&ctx.device);
+    unsafe {
+        ctx.device.destroy_fence(fence, None);
+        ctx.device.destroy_command_pool(cmd_pool, None);
+    }
+
+    Ok(current_data)
+}
+
+// ---------------------------------------------------------------------------
+// Streaming GPU forward pass (for large models with 80+ layers)
+// ---------------------------------------------------------------------------
+
+/// Streaming forward pass that reuses VulkanContext, command buffers, and
+/// ping-pong activation buffers. Descriptor pool is reset between layers
+/// to avoid exhaustion. Only one layer's packed weights are in VRAM at a time.
+pub fn forward_gpu_streaming(
+    model: &MicroModel,
+    input: &[f32],
+) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+    let total_layers = model.layers.len();
+    log::info!(
+        "Streaming forward: '{}' — {} layers, {} params, {} packed bytes",
+        model.name, total_layers, model.total_params(), model.packed_bytes()
+    );
+
+    let ctx = VulkanContext::new()?;
+    let gemv_pipeline = GemvPipeline::new_large(&ctx.device)?;
+    let act_pipeline = ActivationPipeline::new(&ctx.device)?;
+
+    // Upload codebook (shared, tiny).
+    let mut codebook_buf = AllocatedBuffer::new_staging_with_data(
+        &ctx.device, &ctx.allocator, &model.codebook.magnitudes, "codebook",
+    )?;
+
+    // Command infrastructure.
+    let pool_info = vk::CommandPoolCreateInfo::default()
+        .queue_family_index(ctx.compute_queue_family)
+        .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+    let cmd_pool = unsafe { ctx.device.create_command_pool(&pool_info, None)? };
+
+    let alloc_info = vk::CommandBufferAllocateInfo::default()
+        .command_pool(cmd_pool)
+        .level(vk::CommandBufferLevel::PRIMARY)
+        .command_buffer_count(1);
+    let cmd_bufs = unsafe { ctx.device.allocate_command_buffers(&alloc_info)? };
+    let cmd = cmd_bufs[0];
+
+    let fence = unsafe { ctx.device.create_fence(&vk::FenceCreateInfo::default(), None)? };
+
+    // Current activation vector — starts as input.
+    let mut current_data = input.to_vec();
+
+    let report_interval = std::cmp::max(1, total_layers / 10);
+    let start = std::time::Instant::now();
+
+    for (i, layer) in model.layers.iter().enumerate() {
+        let layer_seed = model.seed.wrapping_add(i as u32 * 12345);
+        let rows = layer.rows as usize;
+
+        // Progress report.
+        if i % report_interval == 0 || i == total_layers - 1 {
+            let elapsed = start.elapsed().as_secs_f64();
+            let rate = if i > 0 { i as f64 / elapsed } else { 0.0 };
+            log::info!(
+                "  Layer {}/{} ({:.0} layers/sec) — {}×{} {}",
+                i + 1, total_layers, rate,
+                layer.rows, layer.cols,
+                if layer.activation != Activation::None { "+act" } else { "" }
+            );
+        }
+
+        // Reset descriptor pool to reclaim descriptor sets.
+        unsafe {
+            ctx.device.reset_descriptor_pool(
+                gemv_pipeline.descriptor_pool,
+                vk::DescriptorPoolResetFlags::empty(),
+            )?;
+            ctx.device.reset_descriptor_pool(
+                act_pipeline.descriptor_pool,
+                vk::DescriptorPoolResetFlags::empty(),
+            )?;
+        }
+
+        // Upload packed weights for this layer (freed after dispatch).
+        let mut packed_buf = AllocatedBuffer::new_staging_with_data(
+            &ctx.device, &ctx.allocator, &layer.packed_weights, "packed_w",
+        )?;
+
+        // Upload current input vector.
+        let mut x_buf = AllocatedBuffer::new_staging_with_data(
+            &ctx.device, &ctx.allocator, &current_data, "input_x",
+        )?;
+
+        // Output buffer.
+        let mut y_buf = AllocatedBuffer::new_storage(
+            &ctx.device, &ctx.allocator, (rows as u64) * 4,
+            gpu_allocator::MemoryLocation::CpuToGpu, "output_y",
+        )?;
+
+        // Bind descriptors.
+        let gemv_set = gemv_pipeline.bind_buffers(
+            &ctx.device,
+            packed_buf.buffer, packed_buf.size,
+            codebook_buf.buffer, codebook_buf.size,
+            x_buf.buffer, x_buf.size,
+            y_buf.buffer, y_buf.size,
+        )?;
+
+        let push = GemvPushConstants {
+            seed: layer_seed,
+            m: layer.rows,
+            k: layer.cols,
+        };
+
+        // Record command buffer.
+        let begin_info = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        unsafe {
+            ctx.device.begin_command_buffer(cmd, &begin_info)?;
+            ctx.device.cmd_bind_pipeline(
+                cmd, vk::PipelineBindPoint::COMPUTE, gemv_pipeline.pipeline,
+            );
+            ctx.device.cmd_bind_descriptor_sets(
+                cmd, vk::PipelineBindPoint::COMPUTE,
+                gemv_pipeline.pipeline_layout, 0, &[gemv_set], &[],
+            );
+            ctx.device.cmd_push_constants(
+                cmd, gemv_pipeline.pipeline_layout,
+                vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&push),
+            );
+            ctx.device.cmd_dispatch(cmd, layer.rows, 1, 1);
+
+            // Barrier.
+            let barrier = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+            ctx.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[barrier], &[], &[],
+            );
+
+            // Activation.
+            if layer.activation != Activation::None {
+                let act_set = act_pipeline.bind_buffer(
+                    &ctx.device, y_buf.buffer, y_buf.size,
+                )?;
+                let act_push = ActivationPushConstants {
+                    count: layer.rows,
+                    mode: layer.activation.mode(),
+                };
+                ctx.device.cmd_bind_pipeline(
+                    cmd, vk::PipelineBindPoint::COMPUTE, act_pipeline.pipeline,
+                );
+                ctx.device.cmd_bind_descriptor_sets(
+                    cmd, vk::PipelineBindPoint::COMPUTE,
+                    act_pipeline.pipeline_layout, 0, &[act_set], &[],
+                );
+                ctx.device.cmd_push_constants(
+                    cmd, act_pipeline.pipeline_layout,
+                    vk::ShaderStageFlags::COMPUTE, 0, bytemuck::bytes_of(&act_push),
+                );
+                let groups = (layer.rows + 255) / 256;
+                ctx.device.cmd_dispatch(cmd, groups, 1, 1);
+            }
+
+            ctx.device.end_command_buffer(cmd)?;
+        }
+
+        // Submit and wait.
+        let cmd_arr = [cmd];
+        let submit = vk::SubmitInfo::default().command_buffers(&cmd_arr);
+        unsafe {
+            ctx.device.reset_fences(&[fence])?;
+            ctx.device.queue_submit(ctx.compute_queue, &[submit], fence)?;
+            ctx.device.wait_for_fences(&[fence], true, u64::MAX)?;
+        }
+
+        // Read back.
+        current_data = y_buf.read_back::<f32>(&ctx.device, &ctx.allocator, rows)?;
+
+        // Free layer buffers immediately.
+        y_buf.destroy(&ctx.device, &ctx.allocator);
+        x_buf.destroy(&ctx.device, &ctx.allocator);
+        packed_buf.destroy(&ctx.device, &ctx.allocator);
+    }
+
+    let total_time = start.elapsed();
+    let flops: u64 = model.layers.iter()
+        .map(|l| l.rows as u64 * l.cols as u64 * 2)
+        .sum();
+    let gflops = flops as f64 / total_time.as_secs_f64() / 1e9;
+    log::info!(
+        "Streaming forward complete: {:.3}s, {:.2} GFLOP/s",
+        total_time.as_secs_f64(), gflops
+    );
+
+    // Cleanup.
     codebook_buf.destroy(&ctx.device, &ctx.allocator);
     act_pipeline.destroy(&ctx.device);
     gemv_pipeline.destroy(&ctx.device);

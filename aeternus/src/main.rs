@@ -137,7 +137,7 @@ fn main() {
 
         Commands::Micro { model, validate, bench, iterations } => {
             let m = micro_model::get_model(&model).unwrap_or_else(|| {
-                eprintln!("Unknown model '{}'. Available: nano, micro, mini, small", model);
+                eprintln!("Unknown model '{}'. Available: nano, micro, mini, small, medium, large, xl", model);
                 std::process::exit(1);
             });
 
