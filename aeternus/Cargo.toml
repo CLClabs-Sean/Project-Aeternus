@@ -1,0 +1,17 @@
+[package]
+name = "aeternus"
+version = "0.1.0"
+edition = "2021"
+description = "Procedural Weight Reconstruction engine — Sub-1-Bit SPIM via Rust/Vulkan"
+
+[[bin]]
+name = "aeternus"
+path = "src/main.rs"
+
+[dependencies]
+ash = "0.38"
+gpu-allocator = "0.27"
+bytemuck = { version = "1.16", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"
+clap = { version = "4", features = ["derive"] }
