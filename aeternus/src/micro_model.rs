@@ -235,9 +235,9 @@ pub fn forward_cpu(model: &MicroModel, input: &[f32]) -> Vec<f32> {
 // ---------------------------------------------------------------------------
 
 pub fn forward_gpu(model: &MicroModel, input: &[f32]) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-    // For models with many layers, use the streaming path.
+    // For models with many layers, use the VRAM-resident path.
     if model.layers.len() > 16 {
-        return forward_gpu_streaming(model, input);
+        return forward_gpu_vram_resident(model, input);
     }
 
     let ctx = VulkanContext::new()?;
@@ -387,32 +387,140 @@ pub fn forward_gpu(model: &MicroModel, input: &[f32]) -> Result<Vec<f32>, Box<dy
 }
 
 // ---------------------------------------------------------------------------
-// Streaming GPU forward pass (for large models with 80+ layers)
+// VRAM-Resident GPU forward pass (all weights pre-uploaded, single dispatch)
 // ---------------------------------------------------------------------------
 
-/// Streaming forward pass that reuses VulkanContext, command buffers, and
-/// ping-pong activation buffers. Descriptor pool is reset between layers
-/// to avoid exhaustion. Only one layer's packed weights are in VRAM at a time.
-pub fn forward_gpu_streaming(
+/// VRAM-resident forward pass: uploads ALL packed weights to GPU memory at
+/// startup, records a SINGLE command buffer with all layer dispatches and
+/// barriers, submits once, waits once, reads back only the final output.
+/// This eliminates the CPU↔GPU transfer overhead that dominated the streaming
+/// path (~54× slower than peak).
+///
+/// Uses ping-pong activation buffers on GPU to avoid per-layer readback.
+pub fn forward_gpu_vram_resident(
     model: &MicroModel,
     input: &[f32],
 ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
     let total_layers = model.layers.len();
+    let start = std::time::Instant::now();
+
     log::info!(
-        "Streaming forward: '{}' — {} layers, {} params, {} packed bytes",
-        model.name, total_layers, model.total_params(), model.packed_bytes()
+        "VRAM-resident forward: '{}' — {} layers, {} params, {:.2} MB packed",
+        model.name, total_layers, model.total_params(),
+        model.packed_bytes() as f64 / 1_048_576.0
     );
 
     let ctx = VulkanContext::new()?;
-    let gemv_pipeline = GemvPipeline::new_large(&ctx.device)?;
-    let act_pipeline = ActivationPipeline::new(&ctx.device)?;
 
-    // Upload codebook (shared, tiny).
+    // --- Determine descriptor pool sizes ---
+    // Each layer needs 1 GEMV descriptor set (4 bindings).
+    // Layers with activations need 1 additional activation set (1 binding).
+    let n_act_layers = model.layers.iter()
+        .filter(|l| l.activation != Activation::None)
+        .count();
+    let total_gemv_sets = total_layers;
+    let total_act_sets = n_act_layers;
+    let total_sets = total_gemv_sets + total_act_sets;
+    let total_storage_descriptors = total_gemv_sets * 4 + total_act_sets;
+
+    // Create pipelines with appropriately-sized descriptor pools.
+    let gemv_pipeline = GemvPipeline::new_batch(&ctx.device, total_gemv_sets as u32, (total_gemv_sets * 4) as u32)?;
+    let act_pipeline = ActivationPipeline::new_batch(&ctx.device, total_act_sets.max(1) as u32, total_act_sets.max(1) as u32)?;
+
+    log::info!(
+        "  Descriptor pool: {} sets ({} GEMV + {} act), {} storage descriptors",
+        total_sets, total_gemv_sets, total_act_sets, total_storage_descriptors
+    );
+
+    // --- Phase 1: Upload ALL weights to VRAM ---
+    let upload_start = std::time::Instant::now();
+
     let mut codebook_buf = AllocatedBuffer::new_staging_with_data(
         &ctx.device, &ctx.allocator, &model.codebook.magnitudes, "codebook",
     )?;
 
-    // Command infrastructure.
+    // Upload all packed weight buffers.
+    let mut weight_bufs: Vec<AllocatedBuffer> = Vec::with_capacity(total_layers);
+    for (i, layer) in model.layers.iter().enumerate() {
+        let buf = AllocatedBuffer::new_staging_with_data(
+            &ctx.device, &ctx.allocator, &layer.packed_weights,
+            &format!("w_{}", i),
+        )?;
+        weight_bufs.push(buf);
+    }
+
+    // Upload input vector.
+    let mut input_buf = AllocatedBuffer::new_staging_with_data(
+        &ctx.device, &ctx.allocator, input, "input",
+    )?;
+
+    // Find max activation dimensions for ping-pong buffers.
+    let max_dim: u32 = model.layers.iter()
+        .flat_map(|l| [l.rows, l.cols])
+        .max()
+        .unwrap_or(1);
+
+    // Ping-pong activation buffers — both sized for max dimension.
+    let mut ping_buf = AllocatedBuffer::new_storage(
+        &ctx.device, &ctx.allocator, (max_dim as u64) * 4,
+        gpu_allocator::MemoryLocation::CpuToGpu, "ping",
+    )?;
+    let mut pong_buf = AllocatedBuffer::new_storage(
+        &ctx.device, &ctx.allocator, (max_dim as u64) * 4,
+        gpu_allocator::MemoryLocation::CpuToGpu, "pong",
+    )?;
+
+    let upload_time = upload_start.elapsed();
+    log::info!(
+        "  Weights uploaded to VRAM: {:.2} MB in {:.3}s ({:.1} GB/s)",
+        model.packed_bytes() as f64 / 1_048_576.0,
+        upload_time.as_secs_f64(),
+        model.packed_bytes() as f64 / upload_time.as_secs_f64() / 1e9
+    );
+
+    // --- Phase 2: Bind ALL descriptor sets upfront ---
+    let mut gemv_sets: Vec<vk::DescriptorSet> = Vec::with_capacity(total_layers);
+    let mut act_sets: Vec<Option<vk::DescriptorSet>> = Vec::with_capacity(total_layers);
+
+    for (i, layer) in model.layers.iter().enumerate() {
+        // Determine which buffers this layer reads/writes.
+        // Layer 0 reads from input_buf; subsequent layers alternate ping/pong.
+        let (x_buffer, x_size) = if i == 0 {
+            (input_buf.buffer, input_buf.size)
+        } else if i % 2 == 1 {
+            (ping_buf.buffer, (layer.cols as u64) * 4)
+        } else {
+            (pong_buf.buffer, (layer.cols as u64) * 4)
+        };
+
+        // Output alternates: odd layers → ping, even layers → pong.
+        // (Except layer 0 which writes to ping.)
+        let (y_buffer, y_size) = if i % 2 == 0 {
+            (ping_buf.buffer, (layer.rows as u64) * 4)
+        } else {
+            (pong_buf.buffer, (layer.rows as u64) * 4)
+        };
+
+        let gemv_set = gemv_pipeline.bind_buffers(
+            &ctx.device,
+            weight_bufs[i].buffer, weight_bufs[i].size,
+            codebook_buf.buffer, codebook_buf.size,
+            x_buffer, x_size,
+            y_buffer, y_size,
+        )?;
+        gemv_sets.push(gemv_set);
+
+        if layer.activation != Activation::None {
+            let act_set = act_pipeline.bind_buffer(
+                &ctx.device, y_buffer, y_size,
+            )?;
+            act_sets.push(Some(act_set));
+        } else {
+            act_sets.push(None);
+        }
+    }
+
+    // --- Phase 3: Record ONE command buffer for ALL layers ---
     let pool_info = vk::CommandPoolCreateInfo::default()
         .queue_family_index(ctx.compute_queue_family)
         .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
@@ -427,82 +535,28 @@ pub fn forward_gpu_streaming(
 
     let fence = unsafe { ctx.device.create_fence(&vk::FenceCreateInfo::default(), None)? };
 
-    // Current activation vector — starts as input.
-    let mut current_data = input.to_vec();
+    let record_start = std::time::Instant::now();
 
-    let report_interval = std::cmp::max(1, total_layers / 10);
-    let start = std::time::Instant::now();
+    let begin_info = vk::CommandBufferBeginInfo::default()
+        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+    unsafe {
+        ctx.device.begin_command_buffer(cmd, &begin_info)?;
 
-    for (i, layer) in model.layers.iter().enumerate() {
-        let layer_seed = model.seed.wrapping_add(i as u32 * 12345);
-        let rows = layer.rows as usize;
+        for (i, layer) in model.layers.iter().enumerate() {
+            let layer_seed = model.seed.wrapping_add(i as u32 * 12345);
+            let push = GemvPushConstants {
+                seed: layer_seed,
+                m: layer.rows,
+                k: layer.cols,
+            };
 
-        // Progress report.
-        if i % report_interval == 0 || i == total_layers - 1 {
-            let elapsed = start.elapsed().as_secs_f64();
-            let rate = if i > 0 { i as f64 / elapsed } else { 0.0 };
-            log::info!(
-                "  Layer {}/{} ({:.0} layers/sec) — {}×{} {}",
-                i + 1, total_layers, rate,
-                layer.rows, layer.cols,
-                if layer.activation != Activation::None { "+act" } else { "" }
-            );
-        }
-
-        // Reset descriptor pool to reclaim descriptor sets.
-        unsafe {
-            ctx.device.reset_descriptor_pool(
-                gemv_pipeline.descriptor_pool,
-                vk::DescriptorPoolResetFlags::empty(),
-            )?;
-            ctx.device.reset_descriptor_pool(
-                act_pipeline.descriptor_pool,
-                vk::DescriptorPoolResetFlags::empty(),
-            )?;
-        }
-
-        // Upload packed weights for this layer (freed after dispatch).
-        let mut packed_buf = AllocatedBuffer::new_staging_with_data(
-            &ctx.device, &ctx.allocator, &layer.packed_weights, "packed_w",
-        )?;
-
-        // Upload current input vector.
-        let mut x_buf = AllocatedBuffer::new_staging_with_data(
-            &ctx.device, &ctx.allocator, &current_data, "input_x",
-        )?;
-
-        // Output buffer.
-        let mut y_buf = AllocatedBuffer::new_storage(
-            &ctx.device, &ctx.allocator, (rows as u64) * 4,
-            gpu_allocator::MemoryLocation::CpuToGpu, "output_y",
-        )?;
-
-        // Bind descriptors.
-        let gemv_set = gemv_pipeline.bind_buffers(
-            &ctx.device,
-            packed_buf.buffer, packed_buf.size,
-            codebook_buf.buffer, codebook_buf.size,
-            x_buf.buffer, x_buf.size,
-            y_buf.buffer, y_buf.size,
-        )?;
-
-        let push = GemvPushConstants {
-            seed: layer_seed,
-            m: layer.rows,
-            k: layer.cols,
-        };
-
-        // Record command buffer.
-        let begin_info = vk::CommandBufferBeginInfo::default()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        unsafe {
-            ctx.device.begin_command_buffer(cmd, &begin_info)?;
+            // GEMV dispatch.
             ctx.device.cmd_bind_pipeline(
                 cmd, vk::PipelineBindPoint::COMPUTE, gemv_pipeline.pipeline,
             );
             ctx.device.cmd_bind_descriptor_sets(
                 cmd, vk::PipelineBindPoint::COMPUTE,
-                gemv_pipeline.pipeline_layout, 0, &[gemv_set], &[],
+                gemv_pipeline.pipeline_layout, 0, &[gemv_sets[i]], &[],
             );
             ctx.device.cmd_push_constants(
                 cmd, gemv_pipeline.pipeline_layout,
@@ -510,7 +564,7 @@ pub fn forward_gpu_streaming(
             );
             ctx.device.cmd_dispatch(cmd, layer.rows, 1, 1);
 
-            // Barrier.
+            // Barrier between GEMV write and next read.
             let barrier = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                 .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
@@ -522,11 +576,8 @@ pub fn forward_gpu_streaming(
                 &[barrier], &[], &[],
             );
 
-            // Activation.
-            if layer.activation != Activation::None {
-                let act_set = act_pipeline.bind_buffer(
-                    &ctx.device, y_buf.buffer, y_buf.size,
-                )?;
+            // Activation dispatch.
+            if let Some(act_set) = act_sets[i] {
                 let act_push = ActivationPushConstants {
                     count: layer.rows,
                     mode: layer.activation.mode(),
@@ -544,40 +595,64 @@ pub fn forward_gpu_streaming(
                 );
                 let groups = (layer.rows + 255) / 256;
                 ctx.device.cmd_dispatch(cmd, groups, 1, 1);
+
+                // Barrier after activation.
+                ctx.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[barrier], &[], &[],
+                );
             }
-
-            ctx.device.end_command_buffer(cmd)?;
         }
 
-        // Submit and wait.
-        let cmd_arr = [cmd];
-        let submit = vk::SubmitInfo::default().command_buffers(&cmd_arr);
-        unsafe {
-            ctx.device.reset_fences(&[fence])?;
-            ctx.device.queue_submit(ctx.compute_queue, &[submit], fence)?;
-            ctx.device.wait_for_fences(&[fence], true, u64::MAX)?;
-        }
-
-        // Read back.
-        current_data = y_buf.read_back::<f32>(&ctx.device, &ctx.allocator, rows)?;
-
-        // Free layer buffers immediately.
-        y_buf.destroy(&ctx.device, &ctx.allocator);
-        x_buf.destroy(&ctx.device, &ctx.allocator);
-        packed_buf.destroy(&ctx.device, &ctx.allocator);
+        ctx.device.end_command_buffer(cmd)?;
     }
 
-    let total_time = start.elapsed();
+    let record_time = record_start.elapsed();
+    log::info!("  Command buffer recorded: {} dispatches in {:.3}ms",
+        total_layers + n_act_layers, record_time.as_secs_f64() * 1000.0);
+
+    // --- Phase 4: Single submit, single wait ---
+    let dispatch_start = std::time::Instant::now();
+    let cmd_arr = [cmd];
+    let submit = vk::SubmitInfo::default().command_buffers(&cmd_arr);
+    unsafe {
+        ctx.device.queue_submit(ctx.compute_queue, &[submit], fence)?;
+        ctx.device.wait_for_fences(&[fence], true, u64::MAX)?;
+    }
+    let dispatch_time = dispatch_start.elapsed();
+
     let flops: u64 = model.layers.iter()
         .map(|l| l.rows as u64 * l.cols as u64 * 2)
         .sum();
-    let gflops = flops as f64 / total_time.as_secs_f64() / 1e9;
+    let gflops = flops as f64 / dispatch_time.as_secs_f64() / 1e9;
     log::info!(
-        "Streaming forward complete: {:.3}s, {:.2} GFLOP/s",
-        total_time.as_secs_f64(), gflops
+        "  GPU dispatch: {:.3}s, {:.2} GFLOP/s (compute only, no transfers)",
+        dispatch_time.as_secs_f64(), gflops
     );
 
-    // Cleanup.
+    // --- Phase 5: Read back final output only ---
+    let final_rows = model.layers.last().unwrap().rows as usize;
+    // Final output is in ping or pong depending on layer count parity.
+    let final_buf = if (total_layers - 1) % 2 == 0 { &mut ping_buf } else { &mut pong_buf };
+    let output = final_buf.read_back::<f32>(&ctx.device, &ctx.allocator, final_rows)?;
+
+    let total_time = start.elapsed();
+    let total_gflops = flops as f64 / total_time.as_secs_f64() / 1e9;
+    log::info!(
+        "  Total (upload+record+dispatch+readback): {:.3}s, {:.2} GFLOP/s",
+        total_time.as_secs_f64(), total_gflops
+    );
+
+    // --- Cleanup ---
+    ping_buf.destroy(&ctx.device, &ctx.allocator);
+    pong_buf.destroy(&ctx.device, &ctx.allocator);
+    input_buf.destroy(&ctx.device, &ctx.allocator);
+    for mut wb in weight_bufs {
+        wb.destroy(&ctx.device, &ctx.allocator);
+    }
     codebook_buf.destroy(&ctx.device, &ctx.allocator);
     act_pipeline.destroy(&ctx.device);
     gemv_pipeline.destroy(&ctx.device);
@@ -586,7 +661,7 @@ pub fn forward_gpu_streaming(
         ctx.device.destroy_command_pool(cmd_pool, None);
     }
 
-    Ok(current_data)
+    Ok(output)
 }
 
 // ---------------------------------------------------------------------------
