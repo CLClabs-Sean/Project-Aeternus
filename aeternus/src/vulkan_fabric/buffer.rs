@@ -85,6 +85,33 @@ impl AllocatedBuffer {
         Ok(buf)
     }
 
+    /// Create a host-visible buffer from raw byte data (avoids bytemuck alignment).
+    pub fn new_staging_with_bytes(
+        device: &ash::Device,
+        allocator: &Arc<Mutex<gpu_allocator::vulkan::Allocator>>,
+        data: &[u8],
+        label: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let size = data.len() as u64;
+        let buf = Self::new_storage(device, allocator, size, MemoryLocation::CpuToGpu, label)?;
+
+        if let Some(ref allocation) = buf.allocation {
+            if let Some(mapped) = allocation.mapped_ptr() {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        data.as_ptr(),
+                        mapped.as_ptr() as *mut u8,
+                        data.len(),
+                    );
+                }
+            } else {
+                return Err("Failed to map staging buffer".into());
+            }
+        }
+
+        Ok(buf)
+    }
+
     /// Read back data from a host-visible buffer.
     pub fn read_back<T: bytemuck::Pod>(
         &self,

@@ -439,11 +439,12 @@ pub fn forward_gpu_vram_resident(
         &ctx.device, &ctx.allocator, &model.codebook.magnitudes, "codebook",
     )?;
 
-    // Upload all packed weight buffers.
+    // Upload all packed weight buffers (use raw bytes to avoid alignment issues).
     let mut weight_bufs: Vec<AllocatedBuffer> = Vec::with_capacity(total_layers);
     for (i, layer) in model.layers.iter().enumerate() {
-        let buf = AllocatedBuffer::new_staging_with_data(
-            &ctx.device, &ctx.allocator, &layer.packed_weights,
+        let bytes: &[u8] = bytemuck::cast_slice(&layer.packed_weights);
+        let buf = AllocatedBuffer::new_staging_with_bytes(
+            &ctx.device, &ctx.allocator, bytes,
             &format!("w_{}", i),
         )?;
         weight_bufs.push(buf);
