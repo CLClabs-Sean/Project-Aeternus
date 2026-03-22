@@ -323,7 +323,7 @@ fn llama_layer_tensors(layer_idx: usize) -> Vec<(String, Activation)> {
 
 /// Ingest a Llama model from safetensors shards.
 ///
-/// Returns a MicroModel with real quantized weights.
+/// Returns a MicroModel with real quantized weights and optimized sign seeds.
 pub fn ingest_llama(
     weights_dir: &Path,
     config: &LlamaConfig,
@@ -334,7 +334,9 @@ pub fn ingest_llama(
     let shards = load_shards(weights_dir)?;
 
     let mut layers = Vec::new();
-    let mut all_sign_packs: Vec<Vec<u32>> = Vec::new();
+    let mut layer_seeds: Vec<u32> = Vec::new();
+    let mut total_corrections = 0usize;
+    let mut total_weights = 0usize;
 
     for layer_idx in 0..config.num_layers {
         let tensor_specs = llama_layer_tensors(layer_idx);
@@ -360,45 +362,56 @@ pub fn ingest_llama(
             // Quantize to 2-bit magnitude + 1-bit sign
             let (magnitude_indices, sign_bits) = quantize_layer(&f32_data, &codebook);
 
-            // Pack magnitudes (16 per u32) and signs (32 per u32)
+            // Phase 7: Optimize PCG seed for sign alignment
+            let sign_data = crate::sign_aligner::optimize_seed(&sign_bits, 10_000);
+
+            total_corrections += sign_data.correction_count;
+            total_weights += sign_data.weight_count;
+            layer_seeds.push(sign_data.seed);
+
+            // Pack magnitudes (16 per u32)
             let packed_magnitudes = codebook::pack_indices(&magnitude_indices);
-            let packed_signs = pack_signs(&sign_bits);
 
             layers.push(PackedLayer {
                 packed_weights: packed_magnitudes,
                 rows,
                 cols,
                 activation: *activation,
+                correction_mask: Some(sign_data.correction_mask),
             });
-
-            all_sign_packs.push(packed_signs);
         }
 
         if (layer_idx + 1) % 4 == 0 || layer_idx == config.num_layers - 1 {
-            log::info!("  Progress: {}/{} layers ingested",
-                layer_idx + 1, config.num_layers);
+            let running_rate = 1.0 - (total_corrections as f64 / total_weights as f64);
+            log::info!("  Progress: {}/{} layers | cumulative match {:.2}% | {:.3} sign bits/param",
+                layer_idx + 1, config.num_layers,
+                running_rate * 100.0,
+                total_corrections as f64 / total_weights as f64);
         }
     }
 
-    // Use the first layer's calibrated codebook as the global one
-    // (Phase 6 will add proper per-layer codebook support)
-    let global_codebook = if !layers.is_empty() {
-        // Re-calibrate from all weights combined would be expensive
-        // For now, use a representative codebook
-        Codebook::default()
-    } else {
-        Codebook::default()
-    };
+    // Use per-layer seeds (store the first one as global for compatibility)
+    let global_seed = layer_seeds.first().copied().unwrap_or(0);
+    let global_codebook = Codebook::default();
 
     let model = MicroModel::from_layers(
         "llama3",
         layers,
-        0, // no PCG seed — using real signs
+        global_seed,
         global_codebook,
     );
 
-    log::info!("Ingestion complete: {} total params, {} packed bytes",
-        model.total_params(), model.packed_bytes());
+    let sign_bits_per_param = total_corrections as f64 / total_weights as f64;
+    let mag_bits = 2.0;
+    let total_bits = mag_bits + sign_bits_per_param;
+
+    log::info!("Ingestion complete:");
+    log::info!("  Total params: {}", model.total_params());
+    log::info!("  Packed bytes: {} ({:.2} bits/param)",
+        model.packed_bytes(), total_bits);
+    log::info!("  Magnitude: {:.1} bits/param", mag_bits);
+    log::info!("  Sign corrections: {} / {} ({:.3} bits/param)",
+        total_corrections, total_weights, sign_bits_per_param);
 
     Ok(model)
 }

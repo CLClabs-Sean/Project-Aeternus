@@ -47,6 +47,9 @@ pub struct PackedLayer {
     pub rows: u32,  // output dim
     pub cols: u32,  // input dim
     pub activation: Activation,
+    /// Phase 7: XOR correction mask for sign alignment.
+    /// None = use PCG seed directly (synthetic), Some = apply XOR corrections (real weights).
+    pub correction_mask: Option<Vec<u32>>,
 }
 
 pub struct MicroModel {
@@ -69,6 +72,7 @@ impl MicroModel {
                 rows,
                 cols,
                 activation: act,
+                correction_mask: None,
             }
         }).collect();
 
@@ -95,9 +99,13 @@ impl MicroModel {
         self.layers.iter().map(|l| l.rows as u64 * l.cols as u64).sum()
     }
 
-    /// Packed size in bytes.
+    /// Packed size in bytes (weights + correction masks).
     pub fn packed_bytes(&self) -> usize {
-        self.layers.iter().map(|l| l.packed_weights.len() * 4).sum()
+        self.layers.iter().map(|l| {
+            let weight_bytes = l.packed_weights.len() * 4;
+            let mask_bytes = l.correction_mask.as_ref().map_or(0, |m| m.len() * 4);
+            weight_bytes + mask_bytes
+        }).sum()
     }
 }
 
