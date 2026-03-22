@@ -131,7 +131,7 @@ pub fn optimize_seed(target_signs: &[u8], max_random_seeds: u32) -> LayerSignDat
     // Phase 1: Random seed screening (subsample scored)
     let mut best_seed = 0u32;
     let mut best_score = 0usize;
-    let mut top4 = Vec::with_capacity(4);
+    let mut top4: Vec<(u32, usize)> = Vec::with_capacity(4);
 
     for i in 0..max_random_seeds {
         let candidate_seed = pcg_hash(i.wrapping_mul(2654435761));
