@@ -36,10 +36,10 @@ impl SignReconstructPipeline {
             PIM_SIGN_REGEN_SPV.len() % 4 == 0,
             "SPIR-V binary length must be a multiple of 4"
         );
-        let spirv: &[u32] = bytemuck::cast_slice(PIM_SIGN_REGEN_SPV);
+        let spirv = super::load_spirv_aligned(PIM_SIGN_REGEN_SPV);
 
         // --- Shader Module ---
-        let shader_create_info = vk::ShaderModuleCreateInfo::default().code(spirv);
+        let shader_create_info = vk::ShaderModuleCreateInfo::default().code(&spirv);
         let shader_module = unsafe { device.create_shader_module(&shader_create_info, None)? };
 
         // --- Descriptor Set Layout ---

@@ -28,9 +28,9 @@ pub struct SwarPipeline {
 impl SwarPipeline {
     pub fn new(device: &ash::Device) -> Result<Self, Box<dyn std::error::Error>> {
         assert!(SWAR_EXTRACT_SPV.len() % 4 == 0);
-        let spirv: &[u32] = bytemuck::cast_slice(SWAR_EXTRACT_SPV);
+        let spirv = super::load_spirv_aligned(SWAR_EXTRACT_SPV);
 
-        let shader_create_info = vk::ShaderModuleCreateInfo::default().code(spirv);
+        let shader_create_info = vk::ShaderModuleCreateInfo::default().code(&spirv);
         let shader_module = unsafe { device.create_shader_module(&shader_create_info, None)? };
 
         let bindings = [
