@@ -178,6 +178,79 @@ pub fn admm_factorize(w: &[f32], m: usize, n: usize, rank: usize, max_iters: usi
         }
     }
 
+    // --- Global refinement passes (coordinate descent) ---
+    // Re-optimize each rank slice against the residual of all other slices.
+    // This corrects errors accumulated during greedy deflation.
+    let refinement_sweeps = 3;
+    for _sweep in 0..refinement_sweeps {
+        for k in 0..rank {
+            let b_col_offset = k * b_words_per_col;
+            let a_col_offset = k * a_words_per_col;
+            let old_s = scales[k];
+
+            // Add back this slice's contribution to the residual
+            for i in 0..m {
+                let a_val = get_binary(&a_packed[a_col_offset..a_col_offset + a_words_per_col], i);
+                for j in 0..n {
+                    let b_val = get_binary(&b_packed[b_col_offset..b_col_offset + b_words_per_col], j);
+                    residual[i * n + j] += old_s * a_val * b_val;
+                }
+            }
+
+            // Extract B[:,k] as dense
+            for j in 0..n {
+                b_col[j] = get_binary(&b_packed[b_col_offset..b_col_offset + b_words_per_col], j);
+            }
+
+            // Re-optimize A and B against the updated residual
+            for _iter in 0..max_iters {
+                // A-step
+                for i in 0..m {
+                    let mut dot = 0.0f32;
+                    for j in 0..n {
+                        dot += residual[i * n + j] * b_col[j];
+                    }
+                    a_col[i] = if dot >= 0.0 { 1.0 } else { -1.0 };
+                }
+                // B-step
+                for j in 0..n {
+                    let mut dot = 0.0f32;
+                    for i in 0..m {
+                        dot += residual[i * n + j] * a_col[i];
+                    }
+                    b_col[j] = if dot >= 0.0 { 1.0 } else { -1.0 };
+                }
+            }
+
+            // S-step
+            let mut aRb = 0.0f64;
+            for i in 0..m {
+                let mut row_dot = 0.0f64;
+                for j in 0..n {
+                    row_dot += residual[i * n + j] as f64 * b_col[j] as f64;
+                }
+                aRb += a_col[i] as f64 * row_dot;
+            }
+            let s_k = (aRb / (m as f64 * n as f64)) as f32;
+            scales[k] = s_k;
+
+            // Pack updated A[:,k] and B[:,k]
+            for i in 0..m {
+                set_binary(&mut a_packed[a_col_offset..a_col_offset + a_words_per_col], i, a_col[i]);
+            }
+            for j in 0..n {
+                set_binary(&mut b_packed[b_col_offset..b_col_offset + b_words_per_col], j, b_col[j]);
+            }
+
+            // Deflate residual again with new values
+            for i in 0..m {
+                for j in 0..n {
+                    residual[i * n + j] -= s_k * a_col[i] * b_col[j];
+                }
+            }
+        }
+    }
+
     BinaryFactors {
         a_packed,
         b_packed,
