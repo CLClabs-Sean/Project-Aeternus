@@ -16,6 +16,7 @@ pub mod prefetch;
 pub mod headless;
 pub mod ingestor;
 pub mod sign_aligner;
+pub mod hadamard;
 
 use clap::{Parser, Subcommand};
 

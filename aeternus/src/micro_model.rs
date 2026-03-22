@@ -59,6 +59,8 @@ pub struct MicroModel {
     pub layers: Vec<PackedLayer>,
     pub seed: u32,
     pub codebook: Codebook,
+    /// Phase 7.6: If true, weights are Hadamard-rotated and input must be rotated before GEMV.
+    pub is_rotated: bool,
 }
 
 impl MicroModel {
@@ -84,16 +86,18 @@ impl MicroModel {
             layers,
             seed,
             codebook,
+            is_rotated: false,
         }
     }
 
     /// Create a model from pre-built layers (for ingested real weights).
-    pub fn from_layers(name: &str, layers: Vec<PackedLayer>, seed: u32, codebook: Codebook) -> Self {
+    pub fn from_layers(name: &str, layers: Vec<PackedLayer>, seed: u32, codebook: Codebook, is_rotated: bool) -> Self {
         Self {
             name: name.to_string(),
             layers,
             seed,
             codebook,
+            is_rotated,
         }
     }
 
@@ -235,6 +239,11 @@ pub fn forward_cpu(model: &MicroModel, input: &[f32]) -> Vec<f32> {
     let mut x = input.to_vec();
 
     for (i, layer) in model.layers.iter().enumerate() {
+        // Phase 7.6: Rotate input into Hadamard space if weights are rotated
+        if model.is_rotated {
+            x = crate::hadamard::rotate_input(&x, layer.cols as usize);
+        }
+
         let layer_seed = model.seed.wrapping_add(i as u32 * 12345);
         let mut y = cpu_gemv(
             &layer.packed_weights, &layer.codebook,
@@ -288,6 +297,11 @@ pub fn forward_gpu(model: &MicroModel, input: &[f32]) -> Result<Vec<f32>, Box<dy
         let layer_seed = model.seed.wrapping_add(i as u32 * 12345);
         let rows = layer.rows as usize;
         let cols = layer.cols as usize;
+
+        // Phase 7.6: Rotate input into Hadamard space if weights are rotated
+        if model.is_rotated {
+            current_data = crate::hadamard::rotate_input(&current_data, cols);
+        }
 
         // Upload packed weights for this layer.
         let mut packed_buf = AllocatedBuffer::new_staging_with_data(
@@ -504,8 +518,14 @@ pub fn forward_gpu_vram_resident(
     }
 
     // Upload input vector.
+    // Phase 7.6: Rotate input into Hadamard space if weights are rotated
+    let input_data = if model.is_rotated && !model.layers.is_empty() {
+        crate::hadamard::rotate_input(input, model.layers[0].cols as usize)
+    } else {
+        input.to_vec()
+    };
     let mut input_buf = AllocatedBuffer::new_staging_with_data(
-        &ctx.device, &ctx.allocator, input, "input",
+        &ctx.device, &ctx.allocator, &input_data, "input",
     )?;
 
     // Find max activation dimensions for ping-pong buffers.
