@@ -295,6 +295,15 @@ pub fn forward_gpu(model: &MicroModel, input: &[f32]) -> Result<Vec<f32>, Box<dy
             &ctx.device, &ctx.allocator, &layer.packed_weights, "packed_w",
         )?;
 
+        // Upload correction mask (zeros if no mask).
+        let mask_data: Vec<u32> = match &layer.correction_mask {
+            Some(mask) => mask.clone(),
+            None => vec![0u32; (rows * cols + 31) / 32],
+        };
+        let mut mask_buf = AllocatedBuffer::new_staging_with_data(
+            &ctx.device, &ctx.allocator, &mask_data, "corr_mask",
+        )?;
+
         // Upload current input vector.
         let mut x_buf = AllocatedBuffer::new_staging_with_data(
             &ctx.device, &ctx.allocator, &current_data, "input_x",
@@ -313,6 +322,7 @@ pub fn forward_gpu(model: &MicroModel, input: &[f32]) -> Result<Vec<f32>, Box<dy
             codebook_buf.buffer, codebook_buf.size,
             x_buf.buffer, x_buf.size,
             y_buf.buffer, y_buf.size,
+            mask_buf.buffer, mask_buf.size,
         )?;
 
         let push = GemvPushConstants {
@@ -389,6 +399,7 @@ pub fn forward_gpu(model: &MicroModel, input: &[f32]) -> Result<Vec<f32>, Box<dy
         // Cleanup layer buffers.
         y_buf.destroy(&ctx.device, &ctx.allocator);
         x_buf.destroy(&ctx.device, &ctx.allocator);
+        mask_buf.destroy(&ctx.device, &ctx.allocator);
         packed_buf.destroy(&ctx.device, &ctx.allocator);
     }
 
@@ -439,10 +450,10 @@ pub fn forward_gpu_vram_resident(
     let total_gemv_sets = total_layers;
     let total_act_sets = n_act_layers;
     let total_sets = total_gemv_sets + total_act_sets;
-    let total_storage_descriptors = total_gemv_sets * 4 + total_act_sets;
+    let total_storage_descriptors = total_gemv_sets * 5 + total_act_sets;
 
     // Create pipelines with appropriately-sized descriptor pools.
-    let gemv_pipeline = GemvPipeline::new_batch(&ctx.device, total_gemv_sets as u32, (total_gemv_sets * 4) as u32)?;
+    let gemv_pipeline = GemvPipeline::new_batch(&ctx.device, total_gemv_sets as u32, (total_gemv_sets * 5) as u32)?;
     let act_pipeline = ActivationPipeline::new_batch(&ctx.device, total_act_sets.max(1) as u32, total_act_sets.max(1) as u32)?;
 
     log::info!(
@@ -459,6 +470,7 @@ pub fn forward_gpu_vram_resident(
 
     // Upload all packed weight buffers (use raw bytes to avoid alignment issues).
     let mut weight_bufs: Vec<AllocatedBuffer> = Vec::with_capacity(total_layers);
+    let mut mask_bufs: Vec<AllocatedBuffer> = Vec::with_capacity(total_layers);
     for (i, layer) in model.layers.iter().enumerate() {
         let bytes: &[u8] = bytemuck::cast_slice(&layer.packed_weights);
         let buf = AllocatedBuffer::new_staging_with_bytes(
@@ -466,6 +478,21 @@ pub fn forward_gpu_vram_resident(
             &format!("w_{}", i),
         )?;
         weight_bufs.push(buf);
+
+        // Correction mask buffer (zeros if no mask — synthetic models)
+        let mask_data: Vec<u32> = match &layer.correction_mask {
+            Some(mask) => mask.clone(),
+            None => {
+                let n_params = layer.rows as usize * layer.cols as usize;
+                vec![0u32; (n_params + 31) / 32]
+            }
+        };
+        let mask_bytes: &[u8] = bytemuck::cast_slice(&mask_data);
+        let mask_buf = AllocatedBuffer::new_staging_with_bytes(
+            &ctx.device, &ctx.allocator, mask_bytes,
+            &format!("cm_{}", i),
+        )?;
+        mask_bufs.push(mask_buf);
     }
 
     // Upload input vector.
@@ -526,6 +553,7 @@ pub fn forward_gpu_vram_resident(
             codebook_buf.buffer, codebook_buf.size,
             x_buffer, x_size,
             y_buffer, y_size,
+            mask_bufs[i].buffer, mask_bufs[i].size,
         )?;
         gemv_sets.push(gemv_set);
 
@@ -671,6 +699,9 @@ pub fn forward_gpu_vram_resident(
     input_buf.destroy(&ctx.device, &ctx.allocator);
     for mut wb in weight_bufs {
         wb.destroy(&ctx.device, &ctx.allocator);
+    }
+    for mut mb in mask_bufs {
+        mb.destroy(&ctx.device, &ctx.allocator);
     }
     codebook_buf.destroy(&ctx.device, &ctx.allocator);
     act_pipeline.destroy(&ctx.device);

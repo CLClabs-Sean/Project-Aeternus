@@ -137,12 +137,20 @@ pub fn run(config: &GemvBenchConfig) -> Result<GemvBenchResult, Box<dyn std::err
         gpu_allocator::MemoryLocation::CpuToGpu, "output_y",
     )?;
 
+    // Dummy correction mask (all-zeros = no corrections for synthetic bench).
+    let n_params = (m * k) as usize;
+    let mask_data = vec![0u32; (n_params + 31) / 32];
+    let mut mask_buf = AllocatedBuffer::new_staging_with_data(
+        &ctx.device, &ctx.allocator, &mask_data, "corr_mask",
+    )?;
+
     let desc_set = pipeline.bind_buffers(
         &ctx.device,
         packed_buf.buffer, packed_buf.size,
         codebook_buf.buffer, codebook_buf.size,
         x_buf.buffer, x_buf.size,
         y_buf.buffer, y_buf.size,
+        mask_buf.buffer, mask_buf.size,
     )?;
 
     // Command infrastructure.

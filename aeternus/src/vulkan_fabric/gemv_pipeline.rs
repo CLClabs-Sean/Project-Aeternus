@@ -34,7 +34,7 @@ impl GemvPipeline {
         let shader_create_info = vk::ShaderModuleCreateInfo::default().code(&spirv);
         let shader_module = unsafe { device.create_shader_module(&shader_create_info, None)? };
 
-        // 4 bindings: packed_w, codebook, x, y
+        // 5 bindings: packed_w, codebook, x, y, corr_mask
         let bindings = [
             vk::DescriptorSetLayoutBinding::default()
                 .binding(0).descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
@@ -47,6 +47,9 @@ impl GemvPipeline {
                 .descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE),
             vk::DescriptorSetLayoutBinding::default()
                 .binding(3).descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(4).descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE),
         ];
 
@@ -83,7 +86,7 @@ impl GemvPipeline {
 
         let pool_sizes = [vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::STORAGE_BUFFER)
-            .descriptor_count(64)];
+            .descriptor_count(80)];
         let pool_info = vk::DescriptorPoolCreateInfo::default()
             .max_sets(16)
             .pool_sizes(&pool_sizes);
@@ -102,6 +105,7 @@ impl GemvPipeline {
         codebook: vk::Buffer, codebook_size: u64,
         input_x: vk::Buffer, input_x_size: u64,
         output_y: vk::Buffer, output_y_size: u64,
+        corr_mask: vk::Buffer, corr_mask_size: u64,
     ) -> Result<vk::DescriptorSet, Box<dyn std::error::Error>> {
         let layouts = [self.descriptor_set_layout];
         let alloc_info = vk::DescriptorSetAllocateInfo::default()
@@ -118,6 +122,8 @@ impl GemvPipeline {
             .buffer(input_x).offset(0).range(input_x_size);
         let info3 = vk::DescriptorBufferInfo::default()
             .buffer(output_y).offset(0).range(output_y_size);
+        let info4 = vk::DescriptorBufferInfo::default()
+            .buffer(corr_mask).offset(0).range(corr_mask_size);
 
         let writes = [
             vk::WriteDescriptorSet::default()
@@ -136,6 +142,10 @@ impl GemvPipeline {
                 .dst_set(set).dst_binding(3)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .buffer_info(std::slice::from_ref(&info3)),
+            vk::WriteDescriptorSet::default()
+                .dst_set(set).dst_binding(4)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(std::slice::from_ref(&info4)),
         ];
 
         unsafe { device.update_descriptor_sets(&writes, &[]) };
@@ -162,6 +172,9 @@ impl GemvPipeline {
                 .descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE),
             vk::DescriptorSetLayoutBinding::default()
                 .binding(3).descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(4).descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE),
         ];
 
@@ -199,7 +212,7 @@ impl GemvPipeline {
         // Pool sized for streaming: reset between layers, max 4 sets at once.
         let pool_sizes = [vk::DescriptorPoolSize::default()
             .ty(vk::DescriptorType::STORAGE_BUFFER)
-            .descriptor_count(16)];
+            .descriptor_count(20)];
         let pool_info = vk::DescriptorPoolCreateInfo::default()
             .max_sets(4)
             .pool_sizes(&pool_sizes);
@@ -231,6 +244,9 @@ impl GemvPipeline {
                 .descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE),
             vk::DescriptorSetLayoutBinding::default()
                 .binding(3).descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(4).descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE),
         ];
 

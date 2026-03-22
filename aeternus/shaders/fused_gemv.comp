@@ -19,6 +19,7 @@ layout(set = 0, binding = 0) readonly buffer PackedW { uint packed_w[]; };
 layout(set = 0, binding = 1) readonly buffer Codebook { float magnitudes[4]; };
 layout(set = 0, binding = 2) readonly buffer InputX { float x[]; };
 layout(set = 0, binding = 3) buffer OutputY { float y[]; };
+layout(set = 0, binding = 4) readonly buffer CorrMask { uint corr_mask[]; };
 
 layout(push_constant) uniform Params {
     uint seed;
@@ -51,10 +52,13 @@ void main() {
         // VQ lookup
         float magnitude = magnitudes[mag_idx];
 
-        // PCG sign
+        // PCG sign with XOR correction mask (Phase 7.5 fusion)
         uint weight_global = row * K + k;
         uint hash = pcg_hash(weight_global ^ seed);
-        float sign = (hash % 2u == 0u) ? 1.0 : -1.0;
+        uint corr_word = corr_mask[weight_global >> 5u];
+        uint corr_bit = (corr_word >> (weight_global & 31u)) & 1u;
+        uint sign_bit = (hash & 1u) ^ corr_bit;
+        float sign = (sign_bit == 0u) ? 1.0 : -1.0;
 
         // Fused MAC
         acc += (magnitude * sign) * x[k];
