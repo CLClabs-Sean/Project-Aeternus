@@ -14,6 +14,24 @@ use ash::vk;
 use gpu_allocator::vulkan::{Allocator, AllocatorCreateDesc};
 use std::sync::{Arc, Mutex};
 
+/// Safely load SPIR-V bytes into an aligned `Vec<u32>`.
+/// `include_bytes!` does NOT guarantee 4-byte alignment, so `bytemuck::cast_slice`
+/// can panic. This function always returns a properly aligned `Vec<u32>`.
+pub fn load_spirv_aligned(spv_bytes: &[u8]) -> Vec<u32> {
+    assert!(spv_bytes.len() % 4 == 0, "SPIR-V size must be a multiple of 4");
+    let word_count = spv_bytes.len() / 4;
+    let mut words = vec![0u32; word_count];
+    // Copy as raw bytes → guaranteed alignment in the new Vec.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            spv_bytes.as_ptr(),
+            words.as_mut_ptr() as *mut u8,
+            spv_bytes.len(),
+        );
+    }
+    words
+}
+
 /// Top-level Vulkan context.  Owns the instance, device, and allocator.
 pub struct VulkanContext {
     pub entry: ash::Entry,

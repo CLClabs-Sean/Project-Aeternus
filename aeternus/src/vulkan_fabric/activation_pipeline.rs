@@ -26,8 +26,7 @@ pub struct ActivationPipeline {
 
 impl ActivationPipeline {
     pub fn new(device: &ash::Device) -> Result<Self, Box<dyn std::error::Error>> {
-        assert!(ACTIVATION_SPV.len() % 4 == 0);
-        let spirv: &[u32] = bytemuck::cast_slice(ACTIVATION_SPV);
+        let spirv = super::load_spirv_aligned(ACTIVATION_SPV);
 
         let shader_create_info = vk::ShaderModuleCreateInfo::default().code(spirv);
         let shader_module = unsafe { device.create_shader_module(&shader_create_info, None)? };
@@ -88,8 +87,7 @@ impl ActivationPipeline {
 
     /// Create with custom-sized descriptor pool for batched (VRAM-resident) forward passes.
     pub fn new_batch(device: &ash::Device, max_sets: u32, descriptor_count: u32) -> Result<Self, Box<dyn std::error::Error>> {
-        assert!(ACTIVATION_SPV.len() % 4 == 0);
-        let spirv: &[u32] = bytemuck::cast_slice(ACTIVATION_SPV);
+        let spirv = super::load_spirv_aligned(ACTIVATION_SPV);
 
         let shader_create_info = vk::ShaderModuleCreateInfo::default().code(spirv);
         let shader_module = unsafe { device.create_shader_module(&shader_create_info, None)? };

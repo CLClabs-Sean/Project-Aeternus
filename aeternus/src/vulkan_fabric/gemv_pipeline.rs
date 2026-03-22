@@ -29,8 +29,7 @@ pub struct GemvPipeline {
 
 impl GemvPipeline {
     pub fn new(device: &ash::Device) -> Result<Self, Box<dyn std::error::Error>> {
-        assert!(FUSED_GEMV_SPV.len() % 4 == 0);
-        let spirv: &[u32] = bytemuck::cast_slice(FUSED_GEMV_SPV);
+        let spirv = super::load_spirv_aligned(FUSED_GEMV_SPV);
 
         let shader_create_info = vk::ShaderModuleCreateInfo::default().code(spirv);
         let shader_module = unsafe { device.create_shader_module(&shader_create_info, None)? };
@@ -146,8 +145,7 @@ impl GemvPipeline {
     /// Create a pipeline with a larger descriptor pool for streaming (80+ layer) models.
     /// The pool is designed to be reset between layers, so max_sets=4 is enough.
     pub fn new_large(device: &ash::Device) -> Result<Self, Box<dyn std::error::Error>> {
-        assert!(FUSED_GEMV_SPV.len() % 4 == 0);
-        let spirv: &[u32] = bytemuck::cast_slice(FUSED_GEMV_SPV);
+        let spirv = super::load_spirv_aligned(FUSED_GEMV_SPV);
 
         let shader_create_info = vk::ShaderModuleCreateInfo::default().code(spirv);
         let shader_module = unsafe { device.create_shader_module(&shader_create_info, None)? };
@@ -216,8 +214,7 @@ impl GemvPipeline {
     /// Create a pipeline with a custom-sized descriptor pool for batched
     /// (VRAM-resident) forward passes where all sets are allocated upfront.
     pub fn new_batch(device: &ash::Device, max_sets: u32, descriptor_count: u32) -> Result<Self, Box<dyn std::error::Error>> {
-        assert!(FUSED_GEMV_SPV.len() % 4 == 0);
-        let spirv: &[u32] = bytemuck::cast_slice(FUSED_GEMV_SPV);
+        let spirv = super::load_spirv_aligned(FUSED_GEMV_SPV);
 
         let shader_create_info = vk::ShaderModuleCreateInfo::default().code(spirv);
         let shader_module = unsafe { device.create_shader_module(&shader_create_info, None)? };
