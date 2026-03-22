@@ -50,6 +50,8 @@ pub struct PackedLayer {
     /// Phase 7: XOR correction mask for sign alignment.
     /// None = use PCG seed directly (synthetic), Some = apply XOR corrections (real weights).
     pub correction_mask: Option<Vec<u32>>,
+    /// Phase 6: Per-layer VQ codebook (4 magnitude centroids).
+    pub codebook: Codebook,
 }
 
 pub struct MicroModel {
@@ -73,6 +75,7 @@ impl MicroModel {
                 cols,
                 activation: act,
                 correction_mask: None,
+                codebook: codebook.clone(),
             }
         }).collect();
 
@@ -234,7 +237,7 @@ pub fn forward_cpu(model: &MicroModel, input: &[f32]) -> Vec<f32> {
     for (i, layer) in model.layers.iter().enumerate() {
         let layer_seed = model.seed.wrapping_add(i as u32 * 12345);
         let mut y = cpu_gemv(
-            &layer.packed_weights, &model.codebook,
+            &layer.packed_weights, &layer.codebook,
             &x, layer.rows as usize, layer.cols as usize, layer_seed,
         );
 
@@ -262,10 +265,6 @@ pub fn forward_gpu(model: &MicroModel, input: &[f32]) -> Result<Vec<f32>, Box<dy
     let gemv_pipeline = GemvPipeline::new(&ctx.device)?;
     let act_pipeline = ActivationPipeline::new(&ctx.device)?;
 
-    // Upload codebook (shared across all layers).
-    let mut codebook_buf = AllocatedBuffer::new_staging_with_data(
-        &ctx.device, &ctx.allocator, &model.codebook.magnitudes, "codebook",
-    )?;
 
     // Command infrastructure.
     let pool_info = vk::CommandPoolCreateInfo::default()
@@ -313,6 +312,11 @@ pub fn forward_gpu(model: &MicroModel, input: &[f32]) -> Result<Vec<f32>, Box<dy
         let mut y_buf = AllocatedBuffer::new_storage(
             &ctx.device, &ctx.allocator, (rows as u64) * 4,
             gpu_allocator::MemoryLocation::CpuToGpu, "output_y",
+        )?;
+
+        // Upload per-layer codebook.
+        let mut codebook_buf = AllocatedBuffer::new_staging_with_data(
+            &ctx.device, &ctx.allocator, &layer.codebook.magnitudes, "codebook",
         )?;
 
         // Bind GEMV descriptors.
@@ -399,12 +403,12 @@ pub fn forward_gpu(model: &MicroModel, input: &[f32]) -> Result<Vec<f32>, Box<dy
         // Cleanup layer buffers.
         y_buf.destroy(&ctx.device, &ctx.allocator);
         x_buf.destroy(&ctx.device, &ctx.allocator);
+        codebook_buf.destroy(&ctx.device, &ctx.allocator);
         mask_buf.destroy(&ctx.device, &ctx.allocator);
         packed_buf.destroy(&ctx.device, &ctx.allocator);
     }
 
     // Cleanup shared resources.
-    codebook_buf.destroy(&ctx.device, &ctx.allocator);
     act_pipeline.destroy(&ctx.device);
     gemv_pipeline.destroy(&ctx.device);
     unsafe {
@@ -464,13 +468,10 @@ pub fn forward_gpu_vram_resident(
     // --- Phase 1: Upload ALL weights to VRAM ---
     let upload_start = std::time::Instant::now();
 
-    let mut codebook_buf = AllocatedBuffer::new_staging_with_data(
-        &ctx.device, &ctx.allocator, &model.codebook.magnitudes, "codebook",
-    )?;
-
-    // Upload all packed weight buffers (use raw bytes to avoid alignment issues).
+    // Upload all packed weights, correction masks, and per-layer codebooks.
     let mut weight_bufs: Vec<AllocatedBuffer> = Vec::with_capacity(total_layers);
     let mut mask_bufs: Vec<AllocatedBuffer> = Vec::with_capacity(total_layers);
+    let mut codebook_bufs: Vec<AllocatedBuffer> = Vec::with_capacity(total_layers);
     for (i, layer) in model.layers.iter().enumerate() {
         let bytes: &[u8] = bytemuck::cast_slice(&layer.packed_weights);
         let buf = AllocatedBuffer::new_staging_with_bytes(
@@ -493,6 +494,13 @@ pub fn forward_gpu_vram_resident(
             &format!("cm_{}", i),
         )?;
         mask_bufs.push(mask_buf);
+
+        // Per-layer codebook (4 floats = 16 bytes)
+        let cb_buf = AllocatedBuffer::new_staging_with_data(
+            &ctx.device, &ctx.allocator, &layer.codebook.magnitudes,
+            &format!("cb_{}", i),
+        )?;
+        codebook_bufs.push(cb_buf);
     }
 
     // Upload input vector.
@@ -550,7 +558,7 @@ pub fn forward_gpu_vram_resident(
         let gemv_set = gemv_pipeline.bind_buffers(
             &ctx.device,
             weight_bufs[i].buffer, weight_bufs[i].size,
-            codebook_buf.buffer, codebook_buf.size,
+            codebook_bufs[i].buffer, codebook_bufs[i].size,
             x_buffer, x_size,
             y_buffer, y_size,
             mask_bufs[i].buffer, mask_bufs[i].size,
@@ -703,7 +711,9 @@ pub fn forward_gpu_vram_resident(
     for mut mb in mask_bufs {
         mb.destroy(&ctx.device, &ctx.allocator);
     }
-    codebook_buf.destroy(&ctx.device, &ctx.allocator);
+    for mut cb in codebook_bufs {
+        cb.destroy(&ctx.device, &ctx.allocator);
+    }
     act_pipeline.destroy(&ctx.device);
     gemv_pipeline.destroy(&ctx.device);
     unsafe {

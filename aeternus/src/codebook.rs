@@ -115,6 +115,97 @@ pub fn generate_synthetic_packed(seed: u32, count: usize) -> Vec<u32> {
     pack_indices(&indices)
 }
 
+/// K-Means (Lloyd's algorithm) codebook calibration for 4 centroids.
+///
+/// Clusters the absolute values of `weights` into 4 groups using iterative
+/// centroid refinement. Initialization uses percentiles (0th, 33rd, 67th, 95th)
+/// of the sorted |w| distribution for deterministic, fast convergence.
+///
+/// Returns centroids sorted ascending.
+pub fn kmeans_4(weights: &[f32], max_iters: usize) -> Codebook {
+    let n = weights.len();
+    if n < 4 {
+        return Codebook::default();
+    }
+
+    // Work on absolute magnitudes
+    let mut mags: Vec<f32> = weights.iter().map(|w| w.abs()).collect();
+    mags.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Percentile-based initialization (deterministic, avoids pathological starts)
+    let mut centroids = [
+        mags[0],                           // min
+        mags[n / 3],                       // 33rd percentile
+        mags[2 * n / 3],                   // 67th percentile
+        mags[(n as f64 * 0.95) as usize],  // 95th percentile
+    ];
+
+    // Lloyd's iterations
+    for _iter in 0..max_iters {
+        // Assignment step: assign each magnitude to nearest centroid
+        let mut sums = [0.0f64; 4];
+        let mut counts = [0usize; 4];
+
+        for &mag in &mags {
+            let mut best_k = 0usize;
+            let mut best_dist = f32::MAX;
+            for (k, &c) in centroids.iter().enumerate() {
+                let d = (mag - c).abs();
+                if d < best_dist {
+                    best_dist = d;
+                    best_k = k;
+                }
+            }
+            sums[best_k] += mag as f64;
+            counts[best_k] += 1;
+        }
+
+        // Update step: recompute centroids
+        let mut converged = true;
+        for k in 0..4 {
+            if counts[k] > 0 {
+                let new_c = (sums[k] / counts[k] as f64) as f32;
+                if (new_c - centroids[k]).abs() > 1e-7 {
+                    converged = false;
+                }
+                centroids[k] = new_c;
+            }
+        }
+
+        if converged {
+            break;
+        }
+    }
+
+    // Sort centroids ascending (important: index 0 = smallest magnitude)
+    centroids.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    Codebook::new(centroids)
+}
+
+/// Compute the mean squared error between original weights and their
+/// quantized reconstruction using the given codebook (magnitude only, ignoring signs).
+pub fn quantization_mse(weights: &[f32], codebook: &Codebook) -> f64 {
+    if weights.is_empty() {
+        return 0.0;
+    }
+
+    let total_sq_err: f64 = weights.iter().map(|&w| {
+        let mag = w.abs();
+        // Find nearest centroid
+        let mut best_dist = f32::MAX;
+        for &c in &codebook.magnitudes {
+            let d = (mag - c).abs();
+            if d < best_dist {
+                best_dist = d;
+            }
+        }
+        (best_dist as f64) * (best_dist as f64)
+    }).sum();
+
+    total_sq_err / weights.len() as f64
+}
+
 /// Compute storage cost in bits per parameter.
 pub fn bits_per_param() -> f64 {
     // 2 bits magnitude + ~0 bits sign (PCG) + amortized codebook (128 bits / N)

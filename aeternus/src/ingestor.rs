@@ -337,6 +337,7 @@ pub fn ingest_llama(
     let mut layer_seeds: Vec<u32> = Vec::new();
     let mut total_corrections = 0usize;
     let mut total_weights = 0usize;
+    let mut total_mse = 0.0f64;
 
     for layer_idx in 0..config.num_layers {
         let tensor_specs = llama_layer_tensors(layer_idx);
@@ -356,8 +357,17 @@ pub fn ingest_llama(
             let rows = meta.shape[0] as u32;
             let cols = if meta.shape.len() > 1 { meta.shape[1] as u32 } else { 1 };
 
-            // Calibrate per-layer codebook
-            let codebook = calibrate_codebook(&f32_data);
+            // Phase 6: K-Means codebook calibration (replaces half-normal quartiles)
+            let codebook = codebook::kmeans_4(&f32_data, 10);
+            let old_codebook = calibrate_codebook(&f32_data);
+            let kmeans_mse = codebook::quantization_mse(&f32_data, &codebook);
+            let quartile_mse = codebook::quantization_mse(&f32_data, &old_codebook);
+            let improvement = if quartile_mse > 0.0 { (1.0 - kmeans_mse / quartile_mse) * 100.0 } else { 0.0 };
+            log::info!("    codebook: [{:.4}, {:.4}, {:.4}, {:.4}]  MSE: {:.6} (vs quartile {:.6}, {:.1}% better)",
+                codebook.magnitudes[0], codebook.magnitudes[1],
+                codebook.magnitudes[2], codebook.magnitudes[3],
+                kmeans_mse, quartile_mse, improvement);
+            total_mse += kmeans_mse * f32_data.len() as f64;
 
             // Quantize to 2-bit magnitude + 1-bit sign
             let (magnitude_indices, sign_bits) = quantize_layer(&f32_data, &codebook);
@@ -378,6 +388,7 @@ pub fn ingest_llama(
                 cols,
                 activation: *activation,
                 correction_mask: Some(sign_data.correction_mask),
+                codebook,
             });
         }
 
@@ -404,12 +415,13 @@ pub fn ingest_llama(
     let sign_bits_per_param = total_corrections as f64 / total_weights as f64;
     let mag_bits = 2.0;
     let total_bits = mag_bits + sign_bits_per_param;
+    let avg_mse = if total_weights > 0 { total_mse / total_weights as f64 } else { 0.0 };
 
     log::info!("Ingestion complete:");
     log::info!("  Total params: {}", model.total_params());
     log::info!("  Packed bytes: {} ({:.2} bits/param)",
         model.packed_bytes(), total_bits);
-    log::info!("  Magnitude: {:.1} bits/param", mag_bits);
+    log::info!("  Magnitude: {:.1} bits/param (k-means MSE: {:.6})", mag_bits, avg_mse);
     log::info!("  Sign corrections: {} / {} ({:.3} bits/param)",
         total_corrections, total_weights, sign_bits_per_param);
 
