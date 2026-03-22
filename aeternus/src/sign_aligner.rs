@@ -106,10 +106,10 @@ fn count_matches_full(target_signs: &[u8], seed: u32) -> usize {
 
 /// Optimize the PCG seed to maximize sign-match with target signs.
 ///
-/// Three-phase search:
-///   1. Random sample 10K seeds, score on 10% subsample → keep top-16
-///   2. Hill-climb around top-16 (±1, ±prime offsets) → score on full data
-///   3. Return best seed + correction mask
+/// Fast three-phase search:
+///   1. Random sample seeds, score on subsample → keep top-4
+///   2. Hill-climb around top-4 using subsample scoring
+///   3. Full-score only the single winner, generate correction mask
 pub fn optimize_seed(target_signs: &[u8], max_random_seeds: u32) -> LayerSignData {
     let n = target_signs.len();
     if n == 0 {
@@ -122,66 +122,57 @@ pub fn optimize_seed(target_signs: &[u8], max_random_seeds: u32) -> LayerSignDat
         };
     }
 
-    // Build a subsample of indices for Phase 1 fast screening
-    let sample_size = (n / 10).max(1000).min(n);
+    // Subsample: 1% of data, min 1000, max 50K — fast enough for millions of candidates
+    let sample_size = (n / 100).max(1000).min(50_000).min(n);
     let sample_indices: Vec<usize> = (0..sample_size)
         .map(|i| (i as u64 * n as u64 / sample_size as u64) as usize)
         .collect();
 
-    // Phase 1: Random seed screening
-    let mut candidates: Vec<(u32, usize)> = Vec::with_capacity(max_random_seeds as usize);
+    // Phase 1: Random seed screening (subsample scored)
+    let mut best_seed = 0u32;
+    let mut best_score = 0usize;
+    let mut top4 = Vec::with_capacity(4);
+
     for i in 0..max_random_seeds {
-        // Use PCG to generate candidate seeds (deterministic but well-distributed)
-        let candidate_seed = pcg_hash(i.wrapping_mul(2654435761)); // Fibonacci hashing
-        let matches = count_matches_sampled(target_signs, candidate_seed, &sample_indices);
-        candidates.push((candidate_seed, matches));
+        let candidate_seed = pcg_hash(i.wrapping_mul(2654435761));
+        let score = count_matches_sampled(target_signs, candidate_seed, &sample_indices);
+        if top4.len() < 4 || score > top4.last().unwrap().1 {
+            top4.push((candidate_seed, score));
+            top4.sort_by(|a, b| b.1.cmp(&a.1));
+            top4.truncate(4);
+        }
     }
 
-    // Keep top-16 candidates
-    candidates.sort_by(|a, b| b.1.cmp(&a.1));
-    candidates.truncate(16);
+    // Phase 2: Hill-climb around top-4 (still subsample scored)
+    let primes = [1u32, 3, 7, 13, 31, 127, 1021, 8191, 65521, 524287];
 
-    if max_random_seeds > 1000 {
-        let best_subsample_rate = candidates[0].1 as f64 / sample_size as f64;
-        log::debug!("  Phase 1: top seed 0x{:08X} subsample match {:.2}%",
-            candidates[0].0, best_subsample_rate * 100.0);
-    }
+    best_seed = top4[0].0;
+    best_score = top4[0].1;
 
-    // Phase 2: Hill-climb around top candidates
-    let primes = [1u32, 3, 7, 13, 31, 61, 127, 251, 509, 1021, 2039, 4093,
-                  8191, 16381, 32749, 65521, 131071, 262139, 524287, 1048573];
-
-    let mut best_seed = candidates[0].0;
-    let mut best_matches = count_matches_full(target_signs, best_seed);
-
-    for &(base_seed, _) in &candidates {
-        // Score base on full data
-        let base_matches = count_matches_full(target_signs, base_seed);
-        if base_matches > best_matches {
-            best_matches = base_matches;
+    for &(base_seed, base_score) in &top4 {
+        if base_score > best_score {
+            best_score = base_score;
             best_seed = base_seed;
         }
-
-        // Try offsets
         for &p in &primes {
             for &offset in &[p, p.wrapping_neg()] {
                 let trial = base_seed.wrapping_add(offset);
-                let trial_matches = count_matches_full(target_signs, trial);
-                if trial_matches > best_matches {
-                    best_matches = trial_matches;
+                let score = count_matches_sampled(target_signs, trial, &sample_indices);
+                if score > best_score {
+                    best_score = score;
                     best_seed = trial;
                 }
             }
         }
     }
 
-    let match_rate = best_matches as f64 / n as f64;
-
-    // Phase 3: Generate correction mask
+    // Phase 3: Full-score ONLY the winner, generate correction mask
+    let full_matches = count_matches_full(target_signs, best_seed);
+    let match_rate = full_matches as f64 / n as f64;
     let correction_mask = compute_correction_mask(target_signs, best_seed);
-    let correction_count = n - best_matches;
+    let correction_count = n - full_matches;
 
-    log::info!("  Seed 0x{:08X}: match {:.2}%, corrections {}/{} ({:.3} bits/param)",
+    log::info!("    Seed 0x{:08X}: match {:.2}%, corrections {}/{} ({:.3} bits/param)",
         best_seed, match_rate * 100.0, correction_count, n,
         correction_count as f64 / n as f64);
 
