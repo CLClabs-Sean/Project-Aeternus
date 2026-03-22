@@ -31,7 +31,7 @@ impl GemvPipeline {
     pub fn new(device: &ash::Device) -> Result<Self, Box<dyn std::error::Error>> {
         let spirv = super::load_spirv_aligned(FUSED_GEMV_SPV);
 
-        let shader_create_info = vk::ShaderModuleCreateInfo::default().code(spirv);
+        let shader_create_info = vk::ShaderModuleCreateInfo::default().code(&spirv);
         let shader_module = unsafe { device.create_shader_module(&shader_create_info, None)? };
 
         // 4 bindings: packed_w, codebook, x, y
@@ -216,7 +216,7 @@ impl GemvPipeline {
     pub fn new_batch(device: &ash::Device, max_sets: u32, descriptor_count: u32) -> Result<Self, Box<dyn std::error::Error>> {
         let spirv = super::load_spirv_aligned(FUSED_GEMV_SPV);
 
-        let shader_create_info = vk::ShaderModuleCreateInfo::default().code(spirv);
+        let shader_create_info = vk::ShaderModuleCreateInfo::default().code(&spirv);
         let shader_module = unsafe { device.create_shader_module(&shader_create_info, None)? };
 
         let bindings = [
