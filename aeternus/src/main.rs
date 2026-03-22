@@ -17,6 +17,7 @@ pub mod headless;
 pub mod ingestor;
 pub mod sign_aligner;
 pub mod hadamard;
+pub mod binary_factor;
 
 use clap::{Parser, Subcommand};
 
@@ -108,6 +109,12 @@ enum Commands {
         /// Number of benchmark iterations.
         #[arg(long, default_value = "3")]
         iterations: u32,
+        /// Quantization mode: vq (default) or binary.
+        #[arg(long, default_value = "vq")]
+        mode: String,
+        /// Binary factorization rank (only used with --mode binary).
+        #[arg(long, default_value = "512")]
+        rank: usize,
     },
 }
 
@@ -251,10 +258,7 @@ fn main() {
             }
         }
 
-        Commands::Ingest { weights_path, config, bench, iterations } => {
-            println!("AETERNUS Phase 5 — Safetensors Ingestor");
-            println!("Weights: {}  |  Config: {}", weights_path, config);
-
+        Commands::Ingest { weights_path, config, bench, iterations, mode, rank } => {
             let llama_config = match config.as_str() {
                 "llama3-8b" => ingestor::LlamaConfig::llama3_8b(),
                 "tiny-llama" => ingestor::LlamaConfig::tiny_llama(),
@@ -264,26 +268,45 @@ fn main() {
                 }
             };
 
-            let model = match ingestor::ingest_llama(
-                std::path::Path::new(&weights_path),
-                &llama_config,
-            ) {
-                Ok(m) => m,
-                Err(e) => {
-                    eprintln!("Ingestion failed: {}", e);
-                    std::process::exit(1);
+            match mode.as_str() {
+                "binary" => {
+                    println!("AETERNUS Phase 8a — Binary Factorization Quality Benchmark");
+                    println!("Weights: {}  |  Config: {}  |  Rank: {}", weights_path, config, rank);
+                    match ingestor::ingest_binary_quality(
+                        std::path::Path::new(&weights_path),
+                        &llama_config,
+                        rank,
+                    ) {
+                        Ok(()) => {},
+                        Err(e) => { eprintln!("Binary factorization failed: {}", e); std::process::exit(1); }
+                    }
                 }
-            };
+                _ => {
+                    println!("AETERNUS Phase 5 — Safetensors Ingestor");
+                    println!("Weights: {}  |  Config: {}", weights_path, config);
 
-            println!("Ingested model: '{}'", model.name);
-            println!("  Layers: {}  |  Params: {}  |  Packed: {} bytes",
-                     model.layers.len(), model.total_params(), model.packed_bytes());
-            println!("  Bits/param: {:.2}", (model.packed_bytes() as f64 * 8.0) / model.total_params() as f64);
+                    let model = match ingestor::ingest_llama(
+                        std::path::Path::new(&weights_path),
+                        &llama_config,
+                    ) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            eprintln!("Ingestion failed: {}", e);
+                            std::process::exit(1);
+                        }
+                    };
 
-            if bench {
-                match micro_model::bench(&model, iterations) {
-                    Ok(()) => {},
-                    Err(e) => { eprintln!("Benchmark failed: {}", e); std::process::exit(1); }
+                    println!("Ingested model: '{}'", model.name);
+                    println!("  Layers: {}  |  Params: {}  |  Packed: {} bytes",
+                             model.layers.len(), model.total_params(), model.packed_bytes());
+                    println!("  Bits/param: {:.2}", (model.packed_bytes() as f64 * 8.0) / model.total_params() as f64);
+
+                    if bench {
+                        match micro_model::bench(&model, iterations) {
+                            Ok(()) => {},
+                            Err(e) => { eprintln!("Benchmark failed: {}", e); std::process::exit(1); }
+                        }
+                    }
                 }
             }
         }

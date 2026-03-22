@@ -429,6 +429,81 @@ pub fn ingest_llama(
     Ok(model)
 }
 
+// ---------------------------------------------------------------------------
+// Phase 8a: Binary Factorization Quality Benchmark
+// ---------------------------------------------------------------------------
+
+/// Run ADMM binary factorization on weight tensors and compare MSE vs k-means VQ.
+pub fn ingest_binary_quality(
+    weights_dir: &Path,
+    config: &LlamaConfig,
+    rank: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let shards = load_shards(weights_dir)?;
+    let max_tensors = 4;
+    let admm_iters = 10;
+    let mut tensor_count = 0;
+
+    log::info!("Binary factorization benchmark: rank={}, max_tensors={}", rank, max_tensors);
+
+    for layer_idx in 0..config.num_layers {
+        if tensor_count >= max_tensors { break; }
+        let tensor_specs = llama_layer_tensors(layer_idx);
+
+        for (tensor_name, _activation) in &tensor_specs {
+            if tensor_count >= max_tensors { break; }
+
+            let shard = match find_tensor(&shards, tensor_name) {
+                Some(s) => s,
+                None => continue,
+            };
+
+            let meta = shard.tensor_meta(tensor_name).unwrap();
+            let f32_data = shard.tensor_as_f32(tensor_name)?;
+            let rows = meta.shape[0];
+            let cols = if meta.shape.len() > 1 { meta.shape[1] } else { 1 };
+
+            log::info!("Tensor: {} [{} x {}] ({} params)", tensor_name, rows, cols, f32_data.len());
+
+            // K-Means VQ baseline
+            let vq_start = std::time::Instant::now();
+            let codebook = codebook::kmeans_4(&f32_data, 10);
+            let vq_mse = codebook::quantization_mse(&f32_data, &codebook);
+            let vq_time = vq_start.elapsed();
+
+            let effective_rank = rank.min(rows).min(cols);
+
+            // ADMM binary factorization
+            let admm_start = std::time::Instant::now();
+            let factors = crate::binary_factor::admm_factorize(
+                &f32_data, rows, cols, effective_rank, admm_iters,
+            );
+            let binary_mse = crate::binary_factor::factorization_mse(&f32_data, &factors);
+            let admm_time = admm_start.elapsed();
+
+            let mse_ratio = if vq_mse > 0.0 { binary_mse / vq_mse } else { f64::INFINITY };
+            let bpp = factors.bits_per_param();
+
+            log::info!("  VQ (k-means):  MSE={:.8}  bpp=2.50  time={:.2}s", vq_mse, vq_time.as_secs_f64());
+            log::info!("  Binary (r={}): MSE={:.8}  bpp={:.3}  time={:.2}s  ratio={:.2}x",
+                effective_rank, binary_mse, bpp, admm_time.as_secs_f64(), mse_ratio);
+
+            if binary_mse < vq_mse {
+                log::info!("  >> BINARY WINS ({:.1}% lower MSE at {:.2} bpp)",
+                    (1.0 - binary_mse / vq_mse) * 100.0, bpp);
+            } else {
+                log::info!("  >> VQ WINS ({:.1}% lower MSE at 2.50 bpp)",
+                    (1.0 - vq_mse / binary_mse) * 100.0);
+            }
+
+            tensor_count += 1;
+        }
+    }
+
+    log::info!("Binary factorization benchmark complete ({} tensors)", tensor_count);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
