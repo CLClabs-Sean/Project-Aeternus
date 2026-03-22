@@ -357,30 +357,20 @@ pub fn ingest_llama(
             let rows = meta.shape[0] as u32;
             let cols = if meta.shape.len() > 1 { meta.shape[1] as u32 } else { 1 };
 
-            // Phase 7.6: Hadamard weight rotation (de-randomizes signs)
-            let (before_pos, before_run) = crate::hadamard::sign_stats(&f32_data);
-            let (rotated_weights, padded_cols) = crate::hadamard::rotate_weight_rows(
-                &f32_data, rows as usize, cols as usize,
-            );
-            let (after_pos, after_run) = crate::hadamard::sign_stats(&rotated_weights);
-            log::info!("    Hadamard: cols {}→{}, sign runs {:.1}→{:.1} (pos {:.1}%→{:.1}%)",
-                cols, padded_cols, before_run, after_run,
-                before_pos * 100.0, after_pos * 100.0);
-
-            // Phase 6: K-Means codebook on ROTATED weights
-            let codebook = codebook::kmeans_4(&rotated_weights, 10);
-            let old_codebook = calibrate_codebook(&rotated_weights);
-            let kmeans_mse = codebook::quantization_mse(&rotated_weights, &codebook);
-            let quartile_mse = codebook::quantization_mse(&rotated_weights, &old_codebook);
+            // Phase 6: K-Means codebook calibration
+            let codebook = codebook::kmeans_4(&f32_data, 10);
+            let old_codebook = calibrate_codebook(&f32_data);
+            let kmeans_mse = codebook::quantization_mse(&f32_data, &codebook);
+            let quartile_mse = codebook::quantization_mse(&f32_data, &old_codebook);
             let improvement = if quartile_mse > 0.0 { (1.0 - kmeans_mse / quartile_mse) * 100.0 } else { 0.0 };
             log::info!("    codebook: [{:.4}, {:.4}, {:.4}, {:.4}]  MSE: {:.6} (vs quartile {:.6}, {:.1}% better)",
                 codebook.magnitudes[0], codebook.magnitudes[1],
                 codebook.magnitudes[2], codebook.magnitudes[3],
                 kmeans_mse, quartile_mse, improvement);
-            total_mse += kmeans_mse * rotated_weights.len() as f64;
+            total_mse += kmeans_mse * f32_data.len() as f64;
 
-            // Quantize ROTATED weights to 2-bit magnitude + 1-bit sign
-            let (magnitude_indices, sign_bits) = quantize_layer(&rotated_weights, &codebook);
+            // Quantize to 2-bit magnitude + 1-bit sign
+            let (magnitude_indices, sign_bits) = quantize_layer(&f32_data, &codebook);
 
             // Phase 7: Optimize PCG seed for sign alignment
             let sign_data = crate::sign_aligner::optimize_seed(&sign_bits, 10_000);
@@ -395,7 +385,7 @@ pub fn ingest_llama(
             layers.push(PackedLayer {
                 packed_weights: packed_magnitudes,
                 rows,
-                cols: padded_cols as u32,
+                cols,
                 activation: *activation,
                 correction_mask: Some(sign_data.correction_mask),
                 codebook,
@@ -420,7 +410,7 @@ pub fn ingest_llama(
         layers,
         global_seed,
         global_codebook,
-        true, // Phase 7.6: weights are Hadamard-rotated
+        false, // Phase 7.6 reverted: Hadamard rotation disabled (negative result)
     );
 
     let sign_bits_per_param = total_corrections as f64 / total_weights as f64;
