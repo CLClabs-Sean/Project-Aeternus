@@ -147,7 +147,7 @@ impl GemvPipeline {
     pub fn new_large(device: &ash::Device) -> Result<Self, Box<dyn std::error::Error>> {
         let spirv = super::load_spirv_aligned(FUSED_GEMV_SPV);
 
-        let shader_create_info = vk::ShaderModuleCreateInfo::default().code(spirv);
+        let shader_create_info = vk::ShaderModuleCreateInfo::default().code(&spirv);
         let shader_module = unsafe { device.create_shader_module(&shader_create_info, None)? };
 
         let bindings = [
