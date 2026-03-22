@@ -14,6 +14,7 @@ pub mod micro_model;
 pub mod mesh;
 pub mod prefetch;
 pub mod headless;
+pub mod ingestor;
 
 use clap::{Parser, Subcommand};
 
@@ -89,6 +90,22 @@ enum Commands {
         /// Number of turns.
         #[arg(long, default_value = "4")]
         turns: usize,
+    },
+
+    /// Phase 5: ingest safetensors weights into AETERNUS format.
+    Ingest {
+        /// Path to directory containing .safetensors files.
+        #[arg(long)]
+        weights_path: String,
+        /// Model config: llama3-8b, tiny-llama.
+        #[arg(long, default_value = "llama3-8b")]
+        config: String,
+        /// Run benchmark after ingestion.
+        #[arg(long)]
+        bench: bool,
+        /// Number of benchmark iterations.
+        #[arg(long, default_value = "3")]
+        iterations: u32,
     },
 }
 
@@ -229,6 +246,43 @@ fn main() {
             match pipeline.run(&goal, turns) {
                 Ok(result) => println!("{}", result),
                 Err(e) => { eprintln!("Headless failed: {}", e); std::process::exit(1); }
+            }
+        }
+
+        Commands::Ingest { weights_path, config, bench, iterations } => {
+            println!("AETERNUS Phase 5 — Safetensors Ingestor");
+            println!("Weights: {}  |  Config: {}", weights_path, config);
+
+            let llama_config = match config.as_str() {
+                "llama3-8b" => ingestor::LlamaConfig::llama3_8b(),
+                "tiny-llama" => ingestor::LlamaConfig::tiny_llama(),
+                _ => {
+                    eprintln!("Unknown config '{}'. Available: llama3-8b, tiny-llama", config);
+                    std::process::exit(1);
+                }
+            };
+
+            let model = match ingestor::ingest_llama(
+                std::path::Path::new(&weights_path),
+                &llama_config,
+            ) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("Ingestion failed: {}", e);
+                    std::process::exit(1);
+                }
+            };
+
+            println!("Ingested model: '{}'", model.name);
+            println!("  Layers: {}  |  Params: {}  |  Packed: {} bytes",
+                     model.layers.len(), model.total_params(), model.packed_bytes());
+            println!("  Bits/param: {:.2}", (model.packed_bytes() as f64 * 8.0) / model.total_params() as f64);
+
+            if bench {
+                match micro_model::bench(&model, iterations) {
+                    Ok(()) => {},
+                    Err(e) => { eprintln!("Benchmark failed: {}", e); std::process::exit(1); }
+                }
             }
         }
     }

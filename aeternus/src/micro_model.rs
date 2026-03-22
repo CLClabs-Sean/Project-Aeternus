@@ -80,6 +80,16 @@ impl MicroModel {
         }
     }
 
+    /// Create a model from pre-built layers (for ingested real weights).
+    pub fn from_layers(name: &str, layers: Vec<PackedLayer>, seed: u32, codebook: Codebook) -> Self {
+        Self {
+            name: name.to_string(),
+            layers,
+            seed,
+            codebook,
+        }
+    }
+
     /// Total parameters across all layers.
     pub fn total_params(&self) -> u64 {
         self.layers.iter().map(|l| l.rows as u64 * l.cols as u64).sum()
