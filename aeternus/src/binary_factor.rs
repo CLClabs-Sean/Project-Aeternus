@@ -243,10 +243,10 @@ pub fn admm_factorize(w: &[f32], m: usize, n: usize, rank: usize, max_iters: usi
     }
 
     // --- Phase 2: Gram-matrix joint ADMM refinement ---
-    // Instead of per-slice coordinate descent, do joint updates:
-    //   A = sign(W · B · (B^T B)^{-1} · diag(s))
-    //   B = sign(W^T · A · (A^T A)^{-1} · diag(s))
-    //   s[k] = (A[:,k]^T · W · B[:,k]) / (m · n)
+    // Joint updates (scale NOT mixed into sign decisions):
+    //   A = sign(W · B · (B^T B)^{-1})
+    //   B = sign(W^T · A · (A^T A)^{-1})
+    //   s[k] = (A[:,k]^T · W · B[:,k]) / (m · n)  (computed AFTER A,B fixed)
 
     let joint_sweeps = 3;
     for _sweep in 0..joint_sweeps {
@@ -273,11 +273,10 @@ pub fn admm_factorize(w: &[f32], m: usize, n: usize, rank: usize, max_iters: usi
             // Solve (B^T B) z = rhs → z = (B^T B)^{-1} rhs
             let z = cholesky_solve(&g_b, &rhs, rank);
 
-            // A[i,k] = sign(z[k] * s[k])
+            // A[i,k] = sign(z[k]) — scale is NOT part of the sign decision
             for k in 0..rank {
-                let val = z[k] * scales[k] as f64;
                 let a_off = k * a_words;
-                set_binary(&mut a_packed[a_off..a_off + a_words], i, if val >= 0.0 { 1.0 } else { -1.0 });
+                set_binary(&mut a_packed[a_off..a_off + a_words], i, if z[k] >= 0.0 { 1.0 } else { -1.0 });
             }
         }
 
@@ -298,10 +297,10 @@ pub fn admm_factorize(w: &[f32], m: usize, n: usize, rank: usize, max_iters: usi
 
             let z = cholesky_solve(&g_a, &rhs, rank);
 
+            // B[j,k] = sign(z[k]) — scale is NOT part of the sign decision
             for k in 0..rank {
-                let val = z[k] * scales[k] as f64;
                 let b_off = k * b_words;
-                set_binary(&mut b_packed[b_off..b_off + b_words], j, if val >= 0.0 { 1.0 } else { -1.0 });
+                set_binary(&mut b_packed[b_off..b_off + b_words], j, if z[k] >= 0.0 { 1.0 } else { -1.0 });
             }
         }
 
