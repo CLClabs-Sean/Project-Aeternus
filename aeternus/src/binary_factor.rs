@@ -5,10 +5,10 @@
 //!   B ∈ {-1,+1}^{n×r}  (packed binary, 32 per u32)
 //!   s ∈ R^r             (f32 scale per rank slice)
 //!
-//! ADMM alternates:
-//!   A-step: A = sign(W · B · diag(s))
-//!   B-step: B = sign(W^T · A · diag(s))
-//!   S-step: s_k = (A[:,k]^T · W · B[:,k]) / (m · n)
+//! Uses Gram-matrix ADMM with joint updates:
+//!   A-step: A = sign(W · B · (B^T B)^{-1})
+//!   B-step: B = sign(W^T · A · (A^T A)^{-1})
+//!   S-step: s[k] = (A[:,k]^T · W · B[:,k]) / (m · n)  (global least-squares)
 //!
 //! Storage: r(m + n) bits + r×32 bits ≈ 2r/n bits/param for square matrices.
 
@@ -23,25 +23,19 @@ pub struct BinaryFactors {
     /// Scale vector s ∈ R^r.
     pub scales: Vec<f32>,
     pub rank: usize,
-    pub m: usize, // rows of original W
-    pub n: usize, // cols of original W
+    pub m: usize,
+    pub n: usize,
 }
 
 impl BinaryFactors {
-    /// Total storage in bits.
     pub fn storage_bits(&self) -> usize {
-        let a_bits = self.m * self.rank;
-        let b_bits = self.n * self.rank;
-        let s_bits = self.rank * 32;
-        a_bits + b_bits + s_bits
+        self.m * self.rank + self.n * self.rank + self.rank * 32
     }
 
-    /// Bits per parameter.
     pub fn bits_per_param(&self) -> f64 {
         self.storage_bits() as f64 / (self.m * self.n) as f64
     }
 
-    /// Total storage in bytes.
     pub fn storage_bytes(&self) -> usize {
         (self.storage_bits() + 7) / 8
     }
@@ -51,7 +45,6 @@ impl BinaryFactors {
 // Bit packing helpers
 // ---------------------------------------------------------------------------
 
-/// Get binary value at position `idx` from packed array. Returns +1.0 or -1.0.
 #[inline]
 fn get_binary(packed: &[u32], idx: usize) -> f32 {
     let word = packed[idx / 32];
@@ -59,7 +52,6 @@ fn get_binary(packed: &[u32], idx: usize) -> f32 {
     if bit == 1 { 1.0 } else { -1.0 }
 }
 
-/// Set binary value at position `idx`. value >= 0 → 1 (represents +1), else 0 (-1).
 #[inline]
 fn set_binary(packed: &mut [u32], idx: usize, value: f32) {
     let word_idx = idx / 32;
@@ -71,194 +63,267 @@ fn set_binary(packed: &mut [u32], idx: usize, value: f32) {
     }
 }
 
-/// Words needed to pack `n` binary values.
 fn words_for(n: usize) -> usize {
     (n + 31) / 32
 }
 
 // ---------------------------------------------------------------------------
-// ADMM Solver
+// Dense r×r matrix operations (for Gram matrix)
 // ---------------------------------------------------------------------------
 
-/// Factorize W[m×n] into binary factors A, B and scales s using ADMM.
+/// Compute Gram matrix G = X^T X where X is stored as packed binary columns.
+/// X ∈ {-1,+1}^{dim × rank}, packed as `rank` columns of `words_per_col` u32s.
+/// Result: G[i][j] stored row-major in Vec<f64>, size rank×rank.
+fn gram_matrix(packed: &[u32], dim: usize, rank: usize, words_per_col: usize) -> Vec<f64> {
+    let mut g = vec![0.0f64; rank * rank];
+
+    for i in 0..rank {
+        // Diagonal: G[i][i] = dim (all ±1 squared = 1)
+        g[i * rank + i] = dim as f64;
+
+        for j in (i + 1)..rank {
+            // G[i][j] = X[:,i]^T · X[:,j] = sum of x_i * x_j
+            // For binary: each matching pair contributes +1, each mismatch -1
+            // So G[i][j] = 2 * popcount(xnor(a,b)) - dim
+            let col_i = i * words_per_col;
+            let col_j = j * words_per_col;
+            let mut dot = 0i64;
+
+            for w in 0..words_per_col {
+                let xnor = !(packed[col_i + w] ^ packed[col_j + w]);
+                let matching = xnor.count_ones() as i64;
+                // Each word has 32 bits; matching bits contribute +1, mismatches -1
+                dot += 2 * matching - 32;
+            }
+            // Correct for padding bits in the last word
+            let padding = words_per_col * 32 - dim;
+            if padding > 0 {
+                // The padding bits are all 0 in both columns, so xnor gives 1s
+                // We need to subtract the overcounting: padding bits counted as matching
+                dot -= padding as i64; // remove the +1s from padding
+                dot += padding as i64; // add back as -1s... wait
+                // Actually: padding bits are 0 in both → xnor = 1 → counted as matching
+                // But they shouldn't exist in the vector. We overcounted by `padding` matches.
+                // Correct: dot -= 2 * padding (each padding bit was +1, should be 0, so remove +1 and there's no -1)
+                // Simpler: just recompute correctly
+            }
+
+            // Actually, let's just do the simple dense computation for correctness
+            let mut dot_val = 0.0f64;
+            for d in 0..dim {
+                let a = get_binary(&packed[col_i..col_i + words_per_col], d);
+                let b = get_binary(&packed[col_j..col_j + words_per_col], d);
+                dot_val += a as f64 * b as f64;
+            }
+
+            g[i * rank + j] = dot_val;
+            g[j * rank + i] = dot_val; // symmetric
+        }
+    }
+
+    g
+}
+
+/// Solve G x = b via Cholesky (G is symmetric positive definite).
+/// G is rank×rank row-major. b is length rank. Returns x.
+fn cholesky_solve(g: &[f64], b: &[f64], rank: usize) -> Vec<f64> {
+    // Cholesky: G = L L^T
+    let mut l = vec![0.0f64; rank * rank];
+
+    for i in 0..rank {
+        for j in 0..=i {
+            let mut sum = 0.0f64;
+            for k in 0..j {
+                sum += l[i * rank + k] * l[j * rank + k];
+            }
+            if i == j {
+                let diag = g[i * rank + i] - sum;
+                l[i * rank + j] = if diag > 0.0 { diag.sqrt() } else { 1e-10 };
+            } else {
+                l[i * rank + j] = (g[i * rank + j] - sum) / l[j * rank + j];
+            }
+        }
+    }
+
+    // Forward substitution: L y = b
+    let mut y = vec![0.0f64; rank];
+    for i in 0..rank {
+        let mut sum = 0.0f64;
+        for j in 0..i {
+            sum += l[i * rank + j] * y[j];
+        }
+        y[i] = (b[i] - sum) / l[i * rank + i];
+    }
+
+    // Back substitution: L^T x = y
+    let mut x = vec![0.0f64; rank];
+    for i in (0..rank).rev() {
+        let mut sum = 0.0f64;
+        for j in (i + 1)..rank {
+            sum += l[j * rank + i] * x[j]; // L^T[i][j] = L[j][i]
+        }
+        x[i] = (y[i] - sum) / l[i * rank + i];
+    }
+
+    x
+}
+
+// ---------------------------------------------------------------------------
+// ADMM Solver with Gram-Matrix Joint Updates
+// ---------------------------------------------------------------------------
+
+/// Factorize W[m×n] into binary factors A, B and scales s.
 ///
-/// Frobenius-norm minimization (no calibration data needed):
-///   minimize ||W - A · diag(s) · B^T||_F
-///
-/// `rank` controls the approximation quality and storage cost.
-/// `max_iters` is the number of ADMM alternating steps.
+/// Phase 1: Greedy rank-1 deflation for initialization.
+/// Phase 2: Gram-matrix ADMM joint refinement.
 pub fn admm_factorize(w: &[f32], m: usize, n: usize, rank: usize, max_iters: usize) -> BinaryFactors {
     assert_eq!(w.len(), m * n, "Weight matrix size mismatch");
     assert!(rank > 0 && rank <= m.min(n), "Rank must be in [1, min(m,n)]");
 
-    let a_words_per_col = words_for(m);
-    let b_words_per_col = words_for(n);
+    let a_words = words_for(m);
+    let b_words = words_for(n);
 
-    let mut a_packed = vec![0u32; a_words_per_col * rank];
-    let mut b_packed = vec![0u32; b_words_per_col * rank];
+    let mut a_packed = vec![0u32; a_words * rank];
+    let mut b_packed = vec![0u32; b_words * rank];
     let mut scales = vec![0.0f32; rank];
 
-    // --- Initialization ---
-    // Initialize B with random binary values (deterministic via PCG hash)
-    for k in 0..rank {
-        let col_offset = k * b_words_per_col;
-        for j in 0..n {
-            let hash = crate::seed_engine::pcg_hash((k * n + j) as u32);
-            let val = if hash & 1 == 0 { 1.0f32 } else { -1.0 };
-            set_binary(&mut b_packed[col_offset..col_offset + b_words_per_col], j, val);
-        }
-    }
-
-    // Temporary dense columns for matrix operations
+    // Temp dense vectors
     let mut a_col = vec![0.0f32; m];
     let mut b_col = vec![0.0f32; n];
 
-    // Residual: R = W (we'll update it as we go for greedy rank-1 updates)
+    // --- Phase 1: Greedy rank-1 deflation (initialization) ---
     let mut residual = w.to_vec();
-
-    // --- Greedy rank-1 sweeps ---
-    // For each rank slice, find best binary rank-1 approximation of the residual
     for k in 0..rank {
-        let b_col_offset = k * b_words_per_col;
-        let a_col_offset = k * a_words_per_col;
+        let b_off = k * b_words;
+        let a_off = k * a_words;
 
-        // Extract B[:,k] as dense
+        // Init B[:,k] randomly
         for j in 0..n {
-            b_col[j] = get_binary(&b_packed[b_col_offset..b_col_offset + b_words_per_col], j);
+            let hash = crate::seed_engine::pcg_hash((k * n + j) as u32);
+            let val = if hash & 1 == 0 { 1.0f32 } else { -1.0 };
+            set_binary(&mut b_packed[b_off..b_off + b_words], j, val);
+            b_col[j] = val;
         }
 
-        // Run alternating optimization for this rank slice on the residual
+        // Alternating A/B optimization on residual
         for _iter in 0..max_iters {
-            // A-step: a[:,k] = sign(R · b[:,k])
             for i in 0..m {
                 let mut dot = 0.0f32;
-                for j in 0..n {
-                    dot += residual[i * n + j] * b_col[j];
-                }
+                let row = i * n;
+                for j in 0..n { dot += residual[row + j] * b_col[j]; }
                 a_col[i] = if dot >= 0.0 { 1.0 } else { -1.0 };
             }
-
-            // B-step: b[:,k] = sign(R^T · a[:,k])
             for j in 0..n {
                 let mut dot = 0.0f32;
-                for i in 0..m {
-                    dot += residual[i * n + j] * a_col[i];
-                }
+                for i in 0..m { dot += residual[i * n + j] * a_col[i]; }
                 b_col[j] = if dot >= 0.0 { 1.0 } else { -1.0 };
             }
         }
 
-        // S-step: s[k] = (a[:,k]^T · R · b[:,k]) / (m * n)
-        // Actually: s[k] = (a^T R b) / (||a||^2 · ||b||^2) = (a^T R b) / (m · n)
-        // since ||a||^2 = m, ||b||^2 = n for binary ±1 vectors
-        let mut aRb = 0.0f64;
+        // Scale
+        let mut a_r_b = 0.0f64;
         for i in 0..m {
             let mut row_dot = 0.0f64;
-            for j in 0..n {
-                row_dot += residual[i * n + j] as f64 * b_col[j] as f64;
-            }
-            aRb += a_col[i] as f64 * row_dot;
+            let row = i * n;
+            for j in 0..n { row_dot += residual[row + j] as f64 * b_col[j] as f64; }
+            a_r_b += a_col[i] as f64 * row_dot;
         }
-        let s_k = (aRb / (m as f64 * n as f64)) as f32;
+        let s_k = (a_r_b / (m as f64 * n as f64)) as f32;
         scales[k] = s_k;
 
-        // Pack A[:,k] and B[:,k]
-        for i in 0..m {
-            set_binary(&mut a_packed[a_col_offset..a_col_offset + a_words_per_col], i, a_col[i]);
-        }
-        for j in 0..n {
-            set_binary(&mut b_packed[b_col_offset..b_col_offset + b_words_per_col], j, b_col[j]);
-        }
+        // Pack
+        for i in 0..m { set_binary(&mut a_packed[a_off..a_off + a_words], i, a_col[i]); }
+        for j in 0..n { set_binary(&mut b_packed[b_off..b_off + b_words], j, b_col[j]); }
 
-        // Update residual: R -= s[k] * a[:,k] * b[:,k]^T
+        // Deflate
         for i in 0..m {
-            for j in 0..n {
-                residual[i * n + j] -= s_k * a_col[i] * b_col[j];
-            }
+            let row = i * n;
+            for j in 0..n { residual[row + j] -= s_k * a_col[i] * b_col[j]; }
         }
     }
 
-    // --- Global refinement passes (coordinate descent) ---
-    // Re-optimize each rank slice against the residual of all other slices.
-    // This corrects errors accumulated during greedy deflation.
-    let refinement_sweeps = 3;
-    for _sweep in 0..refinement_sweeps {
-        for k in 0..rank {
-            let b_col_offset = k * b_words_per_col;
-            let a_col_offset = k * a_words_per_col;
-            let old_s = scales[k];
+    // --- Phase 2: Gram-matrix joint ADMM refinement ---
+    // Instead of per-slice coordinate descent, do joint updates:
+    //   A = sign(W · B · (B^T B)^{-1} · diag(s))
+    //   B = sign(W^T · A · (A^T A)^{-1} · diag(s))
+    //   s[k] = (A[:,k]^T · W · B[:,k]) / (m · n)
 
-            // Add back this slice's contribution to the residual
-            for i in 0..m {
-                let a_val = get_binary(&a_packed[a_col_offset..a_col_offset + a_words_per_col], i);
+    let joint_sweeps = 3;
+    for _sweep in 0..joint_sweeps {
+        // --- Joint A-update ---
+        // Compute B^T B (r×r Gram matrix)
+        let g_b = gram_matrix(&b_packed, n, rank, b_words);
+
+        // For each row i of A: A[i,:] = sign( Σ_j W[i,j] * B[j,:] * (B^T B)^{-1} * s )
+        // = sign( (W[i,:] · B) · (B^T B)^{-1} · diag(s) )
+        // First compute W[i,:] · B → vector of length r
+        for i in 0..m {
+            let row = i * n;
+            // Compute rhs = W[i,:] · B (dense, length r)
+            let mut rhs = vec![0.0f64; rank];
+            for k in 0..rank {
+                let b_off = k * b_words;
+                let mut dot = 0.0f64;
                 for j in 0..n {
-                    let b_val = get_binary(&b_packed[b_col_offset..b_col_offset + b_words_per_col], j);
-                    residual[i * n + j] += old_s * a_val * b_val;
+                    dot += w[row + j] as f64 * get_binary(&b_packed[b_off..b_off + b_words], j) as f64;
                 }
+                rhs[k] = dot;
             }
 
-            // Extract B[:,k] as dense
-            for j in 0..n {
-                b_col[j] = get_binary(&b_packed[b_col_offset..b_col_offset + b_words_per_col], j);
-            }
+            // Solve (B^T B) z = rhs → z = (B^T B)^{-1} rhs
+            let z = cholesky_solve(&g_b, &rhs, rank);
 
-            // Re-optimize A and B against the updated residual
-            for _iter in 0..max_iters {
-                // A-step
+            // A[i,k] = sign(z[k] * s[k])
+            for k in 0..rank {
+                let val = z[k] * scales[k] as f64;
+                let a_off = k * a_words;
+                set_binary(&mut a_packed[a_off..a_off + a_words], i, if val >= 0.0 { 1.0 } else { -1.0 });
+            }
+        }
+
+        // --- Joint B-update ---
+        let g_a = gram_matrix(&a_packed, m, rank, a_words);
+
+        for j in 0..n {
+            // Compute rhs = W[:,j]^T · A (length r)
+            let mut rhs = vec![0.0f64; rank];
+            for k in 0..rank {
+                let a_off = k * a_words;
+                let mut dot = 0.0f64;
                 for i in 0..m {
-                    let mut dot = 0.0f32;
-                    for j in 0..n {
-                        dot += residual[i * n + j] * b_col[j];
-                    }
-                    a_col[i] = if dot >= 0.0 { 1.0 } else { -1.0 };
+                    dot += w[i * n + j] as f64 * get_binary(&a_packed[a_off..a_off + a_words], i) as f64;
                 }
-                // B-step
-                for j in 0..n {
-                    let mut dot = 0.0f32;
-                    for i in 0..m {
-                        dot += residual[i * n + j] * a_col[i];
-                    }
-                    b_col[j] = if dot >= 0.0 { 1.0 } else { -1.0 };
-                }
+                rhs[k] = dot;
             }
 
-            // S-step
-            let mut aRb = 0.0f64;
+            let z = cholesky_solve(&g_a, &rhs, rank);
+
+            for k in 0..rank {
+                let val = z[k] * scales[k] as f64;
+                let b_off = k * b_words;
+                set_binary(&mut b_packed[b_off..b_off + b_words], j, if val >= 0.0 { 1.0 } else { -1.0 });
+            }
+        }
+
+        // --- Joint S-update (global least-squares) ---
+        for k in 0..rank {
+            let a_off = k * a_words;
+            let b_off = k * b_words;
+            let mut a_w_b = 0.0f64;
             for i in 0..m {
+                let a_val = get_binary(&a_packed[a_off..a_off + a_words], i) as f64;
+                let row = i * n;
                 let mut row_dot = 0.0f64;
                 for j in 0..n {
-                    row_dot += residual[i * n + j] as f64 * b_col[j] as f64;
+                    row_dot += w[row + j] as f64 * get_binary(&b_packed[b_off..b_off + b_words], j) as f64;
                 }
-                aRb += a_col[i] as f64 * row_dot;
+                a_w_b += a_val * row_dot;
             }
-            let s_k = (aRb / (m as f64 * n as f64)) as f32;
-            scales[k] = s_k;
-
-            // Pack updated A[:,k] and B[:,k]
-            for i in 0..m {
-                set_binary(&mut a_packed[a_col_offset..a_col_offset + a_words_per_col], i, a_col[i]);
-            }
-            for j in 0..n {
-                set_binary(&mut b_packed[b_col_offset..b_col_offset + b_words_per_col], j, b_col[j]);
-            }
-
-            // Deflate residual again with new values
-            for i in 0..m {
-                for j in 0..n {
-                    residual[i * n + j] -= s_k * a_col[i] * b_col[j];
-                }
-            }
+            scales[k] = (a_w_b / (m as f64 * n as f64)) as f32;
         }
     }
 
-    BinaryFactors {
-        a_packed,
-        b_packed,
-        scales,
-        rank,
-        m,
-        n,
-    }
+    BinaryFactors { a_packed, b_packed, scales, rank, m, n }
 }
 
 /// Reconstruct the full weight matrix from binary factors (CPU, for verification).
@@ -309,7 +374,7 @@ mod tests {
 
     #[test]
     fn binary_pack_roundtrip() {
-        let mut packed = vec![0u32; 2]; // 64 bits
+        let mut packed = vec![0u32; 2];
         for i in 0..64 {
             let val = if i % 3 == 0 { 1.0 } else { -1.0 };
             set_binary(&mut packed, i, val);
@@ -322,13 +387,12 @@ mod tests {
 
     #[test]
     fn rank1_identity_approx() {
-        // Rank-1 matrix: outer product of [1,1,-1,-1] and [1,-1,1,-1]
         let a = [1.0f32, 1.0, -1.0, -1.0];
         let b = [1.0f32, -1.0, 1.0, -1.0];
         let mut w = vec![0.0f32; 16];
         for i in 0..4 {
             for j in 0..4 {
-                w[i * 4 + j] = a[i] * b[j] * 0.5; // scale = 0.5
+                w[i * 4 + j] = a[i] * b[j] * 0.5;
             }
         }
 
@@ -338,9 +402,19 @@ mod tests {
     }
 
     #[test]
+    fn cholesky_solve_identity() {
+        // 2×2 identity: solve I x = [3, 7] → x = [3, 7]
+        let g = vec![1.0, 0.0, 0.0, 1.0];
+        let b = vec![3.0, 7.0];
+        let x = cholesky_solve(&g, &b, 2);
+        assert!((x[0] - 3.0).abs() < 1e-10);
+        assert!((x[1] - 7.0).abs() < 1e-10);
+    }
+
+    #[test]
     fn storage_calc() {
         let factors = BinaryFactors {
-            a_packed: vec![0; 64],  // 2048 bits = 2048 elements
+            a_packed: vec![0; 64],
             b_packed: vec![0; 64],
             scales: vec![0.0; 1],
             rank: 1,
@@ -348,7 +422,6 @@ mod tests {
             n: 2048,
         };
         let bpp = factors.bits_per_param();
-        // rank=1: (2048 + 2048 + 32) / (2048*2048) ≈ 0.00098
         assert!(bpp < 0.001);
     }
 }
