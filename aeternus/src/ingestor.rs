@@ -473,20 +473,27 @@ pub fn ingest_binary_quality(
 
             let effective_rank = rank.min(rows).min(cols);
 
-            // ADMM binary factorization
+            // Compute column importance (Hessian proxy)
+            let importance = crate::binary_factor::column_importance(&f32_data, rows, cols);
+            let (h_min, h_max, h_ratio) = crate::binary_factor::importance_stats(&importance);
+            log::info!("  Importance: min={:.4} max={:.4} dynamic_range={:.1}x", h_min, h_max, h_ratio);
+
+            // ADMM binary factorization with importance weighting
             let admm_start = std::time::Instant::now();
             let factors = crate::binary_factor::admm_factorize(
                 &f32_data, rows, cols, effective_rank, admm_iters,
+                Some(&importance),
             );
             let binary_mse = crate::binary_factor::factorization_mse(&f32_data, &factors);
+            let weighted_mse = crate::binary_factor::weighted_mse(&f32_data, &factors, &importance);
             let admm_time = admm_start.elapsed();
 
             let mse_ratio = if vq_mse > 0.0 { binary_mse / vq_mse } else { f64::INFINITY };
             let bpp = factors.bits_per_param();
 
             log::info!("  VQ (k-means):  MSE={:.8}  bpp=2.50  time={:.2}s", vq_mse, vq_time.as_secs_f64());
-            log::info!("  Binary (r={}): MSE={:.8}  bpp={:.3}  time={:.2}s  ratio={:.2}x",
-                effective_rank, binary_mse, bpp, admm_time.as_secs_f64(), mse_ratio);
+            log::info!("  Binary (r={}): MSE={:.8}  wMSE={:.8}  bpp={:.3}  time={:.2}s  ratio={:.2}x",
+                effective_rank, binary_mse, weighted_mse, bpp, admm_time.as_secs_f64(), mse_ratio);
 
             if binary_mse < vq_mse {
                 log::info!("  >> BINARY WINS ({:.1}% lower MSE at {:.2} bpp)",

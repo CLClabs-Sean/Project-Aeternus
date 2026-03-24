@@ -5,9 +5,8 @@
 //!   B ∈ {-1,+1}^{n×r}  (packed binary, 32 per u32)
 //!   s ∈ R^r             (f32 scale per rank slice)
 //!
-//! Two-phase solver:
-//!   Phase 1: Greedy rank-1 deflation (initialization)
-//!   Phase 2: Coordinate descent refinement (re-optimize each slice against W)
+//! Supports Hessian-weighted optimization:
+//!   minimize Σ_ij h[j] · (W[i,j] - [A diag(s) B^T][i,j])^2
 //!
 //! Storage: r(m + n) bits + r×32 bits ≈ 2r/n bits/param for square matrices.
 
@@ -63,16 +62,60 @@ fn words_for(n: usize) -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// ADMM Solver
+// Importance Weighting
+// ---------------------------------------------------------------------------
+
+/// Compute per-column squared L2 norm as importance proxy.
+/// h[j] = Σ_i W[i,j]^2
+///
+/// This is a zero-data Hessian proxy: columns with large weights are
+/// more important to reconstruct accurately.
+pub fn column_importance(w: &[f32], m: usize, n: usize) -> Vec<f64> {
+    let mut h = vec![0.0f64; n];
+    for i in 0..m {
+        let row = i * n;
+        for j in 0..n {
+            let v = w[row + j] as f64;
+            h[j] += v * v;
+        }
+    }
+    // Normalize so mean(h) = 1.0 (prevents scale issues in ADMM)
+    let mean = h.iter().sum::<f64>() / n as f64;
+    if mean > 0.0 {
+        for v in h.iter_mut() { *v /= mean; }
+    }
+    h
+}
+
+/// Statistics about importance distribution.
+pub fn importance_stats(h: &[f64]) -> (f64, f64, f64) {
+    let min = h.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max = h.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let ratio = if min > 0.0 { max / min } else { f64::INFINITY };
+    (min, max, ratio)
+}
+
+// ---------------------------------------------------------------------------
+// ADMM Solver with Importance Weighting
 // ---------------------------------------------------------------------------
 
 /// Factorize W[m×n] into binary factors A, B and scales s.
 ///
-/// Phase 1: Greedy rank-1 deflation for initialization.
-/// Phase 2: Coordinate descent refinement on original W.
-pub fn admm_factorize(w: &[f32], m: usize, n: usize, rank: usize, max_iters: usize) -> BinaryFactors {
+/// When `importance` is Some(h) with h.len() == n:
+///   A-step: a[i] = sign(Σ_j h[j] · R[i,j] · b[j])
+///   B-step: b[j] = sign(h[j] · Σ_i R[i,j] · a[i])
+///   S-step: s = (Σ_ij h[j] · a[i] · R[i,j] · b[j]) / (Σ_ij h[j])
+///
+/// When None: uniform weighting (original Frobenius norm).
+pub fn admm_factorize(
+    w: &[f32], m: usize, n: usize, rank: usize, max_iters: usize,
+    importance: Option<&[f64]>,
+) -> BinaryFactors {
     assert_eq!(w.len(), m * n, "Weight matrix size mismatch");
     assert!(rank > 0 && rank <= m.min(n), "Rank must be in [1, min(m,n)]");
+    if let Some(h) = importance {
+        assert_eq!(h.len(), n, "Importance vector length must match n");
+    }
 
     let a_words = words_for(m);
     let b_words = words_for(n);
@@ -83,6 +126,13 @@ pub fn admm_factorize(w: &[f32], m: usize, n: usize, rank: usize, max_iters: usi
 
     let mut a_col = vec![0.0f32; m];
     let mut b_col = vec![0.0f32; n];
+
+    // Uniform weights fallback
+    let uniform = vec![1.0f64; n];
+    let h: &[f64] = importance.unwrap_or(&uniform);
+
+    // Precompute sum of importance for S-step denominator
+    let h_sum: f64 = h.iter().sum();
 
     // --- Phase 1: Greedy rank-1 deflation ---
     let mut residual = w.to_vec();
@@ -97,30 +147,39 @@ pub fn admm_factorize(w: &[f32], m: usize, n: usize, rank: usize, max_iters: usi
             set_binary(&mut b_packed[b_off..b_off + b_words], j, b_col[j]);
         }
 
-        // Alternating optimization on residual
+        // Weighted alternating optimization on residual
         for _iter in 0..max_iters {
+            // A-step: a[i] = sign(Σ_j h[j] · R[i,j] · b[j])
             for i in 0..m {
-                let mut dot = 0.0f32;
+                let mut dot = 0.0f64;
                 let row = i * n;
-                for j in 0..n { dot += residual[row + j] * b_col[j]; }
+                for j in 0..n {
+                    dot += h[j] * residual[row + j] as f64 * b_col[j] as f64;
+                }
                 a_col[i] = if dot >= 0.0 { 1.0 } else { -1.0 };
             }
+            // B-step: b[j] = sign(h[j] · Σ_i R[i,j] · a[i])
             for j in 0..n {
-                let mut dot = 0.0f32;
-                for i in 0..m { dot += residual[i * n + j] * a_col[i]; }
-                b_col[j] = if dot >= 0.0 { 1.0 } else { -1.0 };
+                let mut dot = 0.0f64;
+                for i in 0..m {
+                    dot += residual[i * n + j] as f64 * a_col[i] as f64;
+                }
+                // Weight by h[j]: if h[j] is large, the sign is more determined
+                b_col[j] = if h[j] * dot >= 0.0 { 1.0 } else { -1.0 };
             }
         }
 
-        // Compute scale: s[k] = (a^T R b) / (m * n)
-        let mut a_r_b = 0.0f64;
+        // Weighted scale: s = (Σ_ij h[j] · a[i] · R[i,j] · b[j]) / (Σ_ij h[j])
+        // Since h[j] ≥ 0 and (a[i]·b[j])^2 = 1:
+        // denominator = m · Σ_j h[j] (each h[j] counted m times across rows)
+        let mut num = 0.0f64;
         for i in 0..m {
             let row = i * n;
-            let mut rd = 0.0f64;
-            for j in 0..n { rd += residual[row + j] as f64 * b_col[j] as f64; }
-            a_r_b += a_col[i] as f64 * rd;
+            for j in 0..n {
+                num += h[j] * a_col[i] as f64 * residual[row + j] as f64 * b_col[j] as f64;
+            }
         }
-        scales[k] = (a_r_b / (m as f64 * n as f64)) as f32;
+        scales[k] = (num / (m as f64 * h_sum)) as f32;
 
         // Pack
         for i in 0..m { set_binary(&mut a_packed[a_off..a_off + a_words], i, a_col[i]); }
@@ -134,12 +193,10 @@ pub fn admm_factorize(w: &[f32], m: usize, n: usize, rank: usize, max_iters: usi
         }
     }
 
-    // --- Phase 2: Coordinate descent refinement on original W ---
-    // Re-compute residual from scratch using original W
-    // For each slice k: add back this slice, re-optimize against true residual, deflate
-    let refinement_sweeps = 5; // more sweeps for better convergence
+    // --- Phase 2: Weighted coordinate descent refinement ---
+    let refinement_sweeps = 5;
     for _sweep in 0..refinement_sweeps {
-        // Recompute full residual from scratch each sweep
+        // Recompute full residual from scratch
         residual.copy_from_slice(w);
         for k2 in 0..rank {
             let s2 = scales[k2];
@@ -160,7 +217,7 @@ pub fn admm_factorize(w: &[f32], m: usize, n: usize, rank: usize, max_iters: usi
             let a_off = k * a_words;
             let old_s = scales[k];
 
-            // Add back this slice's contribution
+            // Add back this slice
             for i in 0..m {
                 let a_val = get_binary(&a_packed[a_off..a_off + a_words], i);
                 let row = i * n;
@@ -170,42 +227,46 @@ pub fn admm_factorize(w: &[f32], m: usize, n: usize, rank: usize, max_iters: usi
                 }
             }
 
-            // Extract current B[:,k]
+            // Extract B[:,k]
             for j in 0..n {
                 b_col[j] = get_binary(&b_packed[b_off..b_off + b_words], j);
             }
 
-            // Re-optimize A and B against the residual (which now excludes only this slice)
+            // Weighted re-optimization
             for _iter in 0..max_iters {
                 for i in 0..m {
-                    let mut dot = 0.0f32;
+                    let mut dot = 0.0f64;
                     let row = i * n;
-                    for j in 0..n { dot += residual[row + j] * b_col[j]; }
+                    for j in 0..n {
+                        dot += h[j] * residual[row + j] as f64 * b_col[j] as f64;
+                    }
                     a_col[i] = if dot >= 0.0 { 1.0 } else { -1.0 };
                 }
                 for j in 0..n {
-                    let mut dot = 0.0f32;
-                    for i in 0..m { dot += residual[i * n + j] * a_col[i]; }
-                    b_col[j] = if dot >= 0.0 { 1.0 } else { -1.0 };
+                    let mut dot = 0.0f64;
+                    for i in 0..m {
+                        dot += residual[i * n + j] as f64 * a_col[i] as f64;
+                    }
+                    b_col[j] = if h[j] * dot >= 0.0 { 1.0 } else { -1.0 };
                 }
             }
 
-            // Re-compute scale
-            let mut a_r_b = 0.0f64;
+            // Weighted scale
+            let mut num = 0.0f64;
             for i in 0..m {
                 let row = i * n;
-                let mut rd = 0.0f64;
-                for j in 0..n { rd += residual[row + j] as f64 * b_col[j] as f64; }
-                a_r_b += a_col[i] as f64 * rd;
+                for j in 0..n {
+                    num += h[j] * a_col[i] as f64 * residual[row + j] as f64 * b_col[j] as f64;
+                }
             }
-            let new_s = (a_r_b / (m as f64 * n as f64)) as f32;
-            scales[k] = new_s;
+            scales[k] = (num / (m as f64 * h_sum)) as f32;
 
-            // Pack updated vectors
+            // Pack
             for i in 0..m { set_binary(&mut a_packed[a_off..a_off + a_words], i, a_col[i]); }
             for j in 0..n { set_binary(&mut b_packed[b_off..b_off + b_words], j, b_col[j]); }
 
-            // Deflate with new values
+            // Deflate
+            let new_s = scales[k];
             for i in 0..m {
                 let row = i * n;
                 for j in 0..n { residual[row + j] -= new_s * a_col[i] * b_col[j]; }
@@ -254,6 +315,25 @@ pub fn factorization_mse(w: &[f32], factors: &BinaryFactors) -> f64 {
     sq_err / n
 }
 
+/// Compute weighted MSE: Σ h[j] · (W[i,j] - W'[i,j])^2 / (m · Σ h[j])
+pub fn weighted_mse(w: &[f32], factors: &BinaryFactors, importance: &[f64]) -> f64 {
+    let recon = reconstruct_cpu(factors);
+    let m = factors.m;
+    let n = factors.n;
+    let h_sum: f64 = importance.iter().sum();
+    let mut wmse = 0.0f64;
+
+    for i in 0..m {
+        let row = i * n;
+        for j in 0..n {
+            let d = (w[row + j] - recon[row + j]) as f64;
+            wmse += importance[j] * d * d;
+        }
+    }
+
+    wmse / (m as f64 * h_sum)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -286,9 +366,39 @@ mod tests {
             }
         }
 
-        let factors = admm_factorize(&w, 4, 4, 1, 10);
+        let factors = admm_factorize(&w, 4, 4, 1, 10, None);
         let mse = factorization_mse(&w, &factors);
-        assert!(mse < 1e-6, "Rank-1 matrix should be perfectly recovered, MSE={}", mse);
+        assert!(mse < 1e-6, "Rank-1 should be perfect, MSE={}", mse);
+    }
+
+    #[test]
+    fn column_importance_basic() {
+        // 2×3 matrix: col 0 has large values, col 2 has small
+        let w = vec![10.0, 1.0, 0.1,
+                     10.0, 1.0, 0.1];
+        let h = column_importance(&w, 2, 3);
+        assert_eq!(h.len(), 3);
+        // h[0] should be much larger than h[2]
+        assert!(h[0] > h[2] * 50.0, "col0={} col2={}", h[0], h[2]);
+    }
+
+    #[test]
+    fn weighted_factorization_focuses_on_important_cols() {
+        // Matrix where col 0 has large values, col 1 has small
+        let mut w = vec![0.0f32; 64]; // 8×8
+        for i in 0..8 {
+            w[i * 8] = 5.0;     // col 0: large
+            w[i * 8 + 1] = 0.01; // col 1: tiny
+        }
+
+        let h = column_importance(&w, 8, 8);
+        let factors_w = admm_factorize(&w, 8, 8, 1, 10, Some(&h));
+        let factors_u = admm_factorize(&w, 8, 8, 1, 10, None);
+
+        let wmse_w = weighted_mse(&w, &factors_w, &h);
+        let wmse_u = weighted_mse(&w, &factors_u, &h);
+        // Weighted solver should achieve lower weighted MSE
+        assert!(wmse_w <= wmse_u * 1.01, "Weighted={} Uniform={}", wmse_w, wmse_u);
     }
 
     #[test]
@@ -301,7 +411,6 @@ mod tests {
             m: 2048,
             n: 2048,
         };
-        let bpp = factors.bits_per_param();
-        assert!(bpp < 0.001);
+        assert!(factors.bits_per_param() < 0.001);
     }
 }
